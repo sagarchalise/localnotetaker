@@ -33,7 +33,7 @@ jobs:
           $dll = Get-ChildItem target/release/build -Recurse -Filter foundry_local.dll | Select-Object -First 1
           if (-not $dll) { throw 'foundry_local.dll not found' }
           Copy-Item "$($dll.DirectoryName)/*.dll" $dist
-          Copy-Item sandbox/install.ps1, sandbox/uninstall.ps1 $dist
+          Copy-Item installer/install.ps1, installer/uninstall.ps1 $dist
           Copy-Item README.md $dist
           Compress-Archive -Path $dist -DestinationPath "dist/$name.zip" -Force
 

@@ -1,6 +1,6 @@
 //! Model lifecycle and live transcription sessions.
 //!
-//! SDK 2.x streaming (see spikes/FINDINGS.md): one `AudioSession` per audio source on a single
+//! SDK 2.x streaming (see docs/FINDINGS.md): one `AudioSession` per audio source on a single
 //! loaded model. The first request item is an AUDIO item (format "pcm"), later chunks are pushed
 //! to the input queue as BYTES. The engine emits sub-word text deltas with no final/partial
 //! marker, so utterances are cut here: at sentence-ending punctuation, or after an idle gap.

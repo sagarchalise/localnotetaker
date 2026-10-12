@@ -31,7 +31,6 @@ cargo build --release -p mynotetaker
 
 The executable is `target\release\MyNoteTaker.exe`. The native `*.dll` files from `target\release\build\...\out` must sit next to it. The release workflow does this automatically.
 
-The `sandbox\` scripts are the author's alternative cross-build setups (container and host-based `xwin`).
 
 ## Releases
 
@@ -40,6 +39,5 @@ Pushing a tag such as `v0.1.0` runs the GitHub Actions workflow in `.github/work
 ## Repository layout
 
 - `app\` - the application (egui UI, audio capture, transcription, summarization).
-- `spikes\` - throwaway experiments (catalog check, loopback capture, dual sessions) and `FINDINGS.md`.
-- `sandbox\` - build and packaging scripts.
-- `note_taker_ai.md` - the original project brief.
+- `installer\` - per-user install/uninstall scripts shipped in the release zip.
+- `docs\FINDINGS.md` - notes from the early hardware and audio experiments.

@@ -1,11 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-    "app",
-    "spikes/spike0-catalog",
-    "spikes/spike1-loopback",
-    "spikes/spike2-dual",
-]
+members = ["app"]
 
 [profile.release]
 strip = true
