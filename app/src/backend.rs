@@ -328,6 +328,7 @@ async fn refresh_models(manager: &FoundryLocalManager, ui: &Ui) {
     for list in [&mut speech, &mut chat] {
         list.sort_by_key(|e| (e.size_mb.is_none(), e.size_mb, e.alias.clone()));
     }
+    chat.insert(0, ModelEntry { alias: crate::summarize::AUTO.into(), size_mb: None, cached: false });
     ui.update(|sh| {
         sh.speech_models = speech;
         sh.chat_models = chat;

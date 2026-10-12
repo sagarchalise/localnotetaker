@@ -180,6 +180,9 @@ impl App {
 }
 
 fn model_label(entries: &[ModelEntry], alias: &str) -> String {
+    if alias == summarize::AUTO {
+        return "auto  (best under 1 GB for this machine: NPU or CPU/GPU)".into();
+    }
     match entries.iter().find(|e| e.alias == alias) {
         Some(e) => {
             let size = e.size_mb.map(|m| format!("{m} MB")).unwrap_or_else(|| "? MB".into());
@@ -322,7 +325,7 @@ impl eframe::App for App {
                 let a = model_combo(ui, "speech", &speech, &mut self.speech_sel, "nemotron-speech-streaming-en-0.6b");
                 ui.add_space(4.0);
                 ui.label("Chat model (summary)");
-                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, "qwen3-0.6b");
+                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, summarize::AUTO);
                 if a || b {
                     self.send(Cmd::ApplyModels { speech: self.speech_sel.clone(), chat: self.chat_sel.clone() });
                 }

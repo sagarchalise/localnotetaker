@@ -5,10 +5,35 @@
 use std::sync::Arc;
 
 use foundry_local_sdk::{
-    ChatSession, FoundryLocalManager, Item, Model, Request, RequestOptions, SearchOptions,
+    ChatSession, DeviceType, FoundryLocalManager, Item, Model, Request, RequestOptions, SearchOptions,
 };
 
 use crate::transcriber::{load_model, Progress};
+
+/// `chat_model` value meaning "pick the best sub-1 GB model for this machine".
+pub const AUTO: &str = "auto";
+/// Used when an NPU can run it (885 MB NPU build).
+const AUTO_NPU_MODEL: &str = "qwen2.5-1.5b";
+/// Newest chat model under 1 GB; CPU and GPU only.
+const AUTO_FALLBACK_MODEL: &str = "qwen3-0.6b";
+
+/// The NPU variant of [`AUTO_NPU_MODEL`] if this machine can run it: the catalog offers an NPU
+/// build and its execution provider is registered.
+async fn npu_variant(manager: &FoundryLocalManager) -> Option<String> {
+    let registered: Vec<String> =
+        manager.discover_eps().ok()?.into_iter().filter(|e| e.is_registered).map(|e| e.name).collect();
+    let model = manager.catalog().get_model(AUTO_NPU_MODEL).await.ok()?;
+    model
+        .variants()
+        .iter()
+        .filter_map(|v| v.info().ok())
+        .find(|i| {
+            i.runtime
+                .as_ref()
+                .is_some_and(|r| r.device_type == DeviceType::NPU && registered.contains(&r.execution_provider))
+        })
+        .map(|i| i.id)
+}
 
 // Sized for sub-1 GB models, which have a short effective context.
 const CHUNK_CHARS: usize = 5000;
@@ -26,6 +51,18 @@ impl Summarizer {
         variant: Option<&str>,
         progress: &Progress,
     ) -> anyhow::Result<Self> {
+        if alias == AUTO {
+            if let Some(id) = npu_variant(manager).await {
+                log::info!("auto chat model: trying NPU variant {id}");
+                match load_model(manager, AUTO_NPU_MODEL, Some(&id), progress).await {
+                    Ok(model) => return Ok(Self { model }),
+                    Err(e) => log::warn!("NPU chat model unusable, falling back to {AUTO_FALLBACK_MODEL}: {e:#}"),
+                }
+            } else {
+                log::info!("auto chat model: no usable NPU variant, using {AUTO_FALLBACK_MODEL}");
+            }
+            return Ok(Self { model: load_model(manager, AUTO_FALLBACK_MODEL, None, progress).await? });
+        }
         Ok(Self { model: load_model(manager, alias, variant, progress).await? })
     }
 
