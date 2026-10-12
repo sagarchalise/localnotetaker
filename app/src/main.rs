@@ -70,8 +70,8 @@ fn main() -> anyhow::Result<()> {
         return result;
     }
 
-    let hotkey = hotkey::parse(&cfg.hotkey);
     let hotkey_label = cfg.hotkey.clone();
+    let dictate_label = cfg.dictate_hotkey.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([540.0, 640.0]).with_title("MyNoteTaker"),
         ..Default::default()
@@ -96,34 +96,43 @@ fn main() -> anyhow::Result<()> {
             })?;
 
             // Global hotkey (must be created on the event-loop thread, i.e. here).
-            let hk_manager = match hotkey {
-                Ok(hk) => match GlobalHotKeyManager::new().and_then(|m| m.register(hk).map(|()| m)) {
-                    Ok(m) => {
-                        let (tx, shared, ctx) = (cmd_tx.clone(), ui.shared.clone(), cc.egui_ctx.clone());
-                        let id = hk.id();
-                        GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
-                            let state = shared.lock().unwrap().state;
-                            if e.id == id
-                                && e.state == HotKeyState::Pressed
-                                && matches!(state, UiState::Idle | UiState::Recording)
-                            {
-                                let _ = tx.send(Cmd::Toggle);
-                                ctx.request_repaint();
-                            }
-                        }));
-                        Some(m)
-                    }
-                    Err(e) => {
-                        log::warn!("hotkey registration failed: {e}");
-                        None
-                    }
-                },
+            let hk_manager = match GlobalHotKeyManager::new() {
+                Ok(m) => {
+                    let register = |spec: &str| {
+                        hotkey::parse(spec)
+                            .and_then(|hk| {
+                                m.register(hk)?;
+                                Ok(hk.id())
+                            })
+                            .map_err(|e| log::warn!("hotkey '{spec}' unavailable: {e:#}"))
+                            .ok()
+                    };
+                    let toggle_id = register(&hotkey_label);
+                    let dictate_id = register(&dictate_label);
+                    let (tx, shared, ctx) = (cmd_tx.clone(), ui.shared.clone(), cc.egui_ctx.clone());
+                    GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+                        if e.state != HotKeyState::Pressed {
+                            return;
+                        }
+                        let state = shared.lock().unwrap().state;
+                        let cmd = if Some(e.id) == toggle_id && matches!(state, UiState::Idle | UiState::Recording) {
+                            Cmd::Toggle
+                        } else if Some(e.id) == dictate_id && state == UiState::Idle {
+                            Cmd::Dictate
+                        } else {
+                            return;
+                        };
+                        let _ = tx.send(cmd);
+                        ctx.request_repaint();
+                    }));
+                    Some(m)
+                }
                 Err(e) => {
-                    log::warn!("bad hotkey in config: {e:#}");
+                    log::warn!("hotkey manager failed: {e}");
                     None
                 }
             };
-            Ok(Box::new(App::new(ui, cmd_tx, hk_manager, hotkey_label)))
+            Ok(Box::new(App::new(ui, cmd_tx, hk_manager, hotkey_label, dictate_label)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
@@ -134,6 +143,7 @@ struct App {
     cmd_tx: UnboundedSender<Cmd>,
     _hotkeys: Option<GlobalHotKeyManager>,
     hotkey_label: String,
+    dictate_label: String,
     speech_sel: String,
     chat_sel: String,
     folder: String,
@@ -143,12 +153,19 @@ struct App {
 }
 
 impl App {
-    fn new(ui: Ui, cmd_tx: UnboundedSender<Cmd>, hk: Option<GlobalHotKeyManager>, hotkey_label: String) -> Self {
+    fn new(
+        ui: Ui,
+        cmd_tx: UnboundedSender<Cmd>,
+        hk: Option<GlobalHotKeyManager>,
+        hotkey_label: String,
+        dictate_label: String,
+    ) -> Self {
         Self {
             ui,
             cmd_tx,
             _hotkeys: hk,
             hotkey_label,
+            dictate_label,
             speech_sel: String::new(),
             chat_sel: String::new(),
             folder: String::new(),
@@ -163,6 +180,9 @@ impl App {
 }
 
 fn model_label(entries: &[ModelEntry], alias: &str) -> String {
+    if alias == summarize::AUTO {
+        return "auto  (best under 1 GB for this machine: NPU or CPU/GPU)".into();
+    }
     match entries.iter().find(|e| e.alias == alias) {
         Some(e) => {
             let size = e.size_mb.map(|m| format!("{m} MB")).unwrap_or_else(|| "? MB".into());
@@ -177,18 +197,34 @@ fn model_label(entries: &[ModelEntry], alias: &str) -> String {
 /// Dropdown over catalog entries; returns true if the user picked a different model.
 fn model_combo(ui: &mut egui::Ui, id: &str, entries: &[ModelEntry], selected: &mut String, default: &str) -> bool {
     let before = selected.clone();
-    egui::ComboBox::from_id_salt(id)
+    let filter_id = egui::Id::new((id, "model-filter"));
+    let shown = egui::ComboBox::from_id_salt(id)
         .width(400.0)
         .selected_text(model_label(entries, selected))
         .show_ui(ui, |ui| {
-            for e in entries {
-                let mut label = model_label(entries, &e.alias);
-                if e.alias == default {
-                    label.push_str("  [default]");
+            let mut filter = ui.data_mut(|d| d.get_temp::<String>(filter_id)).unwrap_or_default();
+            ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search models...")).request_focus();
+            let needle = filter.trim().to_lowercase();
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                let mut any = false;
+                for e in entries.iter().filter(|e| e.alias.to_lowercase().contains(&needle)) {
+                    any = true;
+                    let mut label = model_label(entries, &e.alias);
+                    if e.alias == default {
+                        label.push_str("  [default]");
+                    }
+                    ui.selectable_value(selected, e.alias.clone(), label);
                 }
-                ui.selectable_value(selected, e.alias.clone(), label);
-            }
+                if !any {
+                    ui.weak("No models match");
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(filter_id, filter));
         });
+    if shown.inner.is_none() {
+        // Popup closed: the next open starts with an empty search.
+        ui.data_mut(|d| d.remove::<String>(filter_id));
+    }
     *selected != before
 }
 
@@ -196,10 +232,11 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
-        let (state, status, partial, recent, speech, chat, last_note, cfg, generation) = {
+        let (state, dictating, status, partial, recent, speech, chat, last_note, cfg, generation) = {
             let s = self.ui.shared.lock().unwrap();
             (
                 s.state,
+                s.dictating,
                 s.status.clone(),
                 s.partial.clone(),
                 s.recent.clone(),
@@ -263,12 +300,32 @@ impl eframe::App for App {
             ui.small(format!("Global hotkey: {}", self.hotkey_label));
 
             ui.separator();
-            ui.add_enabled_ui(idle, |ui| {
+            ui.label("Meeting context (why this meeting is happening; focuses the summary)");
+            {
+                // The context is shared state: the backend appends dictated text, we edit it here.
+                let mut shared = self.ui.shared.lock().unwrap();
+                ui.add(
+                    egui::TextEdit::multiline(&mut shared.context)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .hint_text("e.g. Weekly sync to settle the launch date and unblock the API migration"),
+                );
+            }
+            ui.horizontal(|ui| {
+                let label = if dictating { "Stop dictating" } else { "Dictate context" };
+                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                    self.send(Cmd::Dictate);
+                }
+                ui.small(format!("Hotkey: {} (not while recording)", self.dictate_label));
+            });
+
+            ui.separator();
+            ui.add_enabled_ui(idle && !dictating, |ui| {
                 ui.label("Speech model (live transcription)");
                 let a = model_combo(ui, "speech", &speech, &mut self.speech_sel, "nemotron-speech-streaming-en-0.6b");
                 ui.add_space(4.0);
                 ui.label("Chat model (summary)");
-                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, "qwen2.5-0.5b");
+                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, summarize::AUTO);
                 if a || b {
                     self.send(Cmd::ApplyModels { speech: self.speech_sel.clone(), chat: self.chat_sel.clone() });
                 }

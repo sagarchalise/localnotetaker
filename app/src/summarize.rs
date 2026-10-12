@@ -1,15 +1,41 @@
-//! Summary with a small (<1 GB) chat model. A 0.5B-class model has a short effective context,
-//! so long transcripts are reduced hierarchically: chunk -> notes, merge notes until they fit,
-//! then one final pass that produces the four required sections.
+//! Summary with a local chat model. Long transcripts are reduced hierarchically: chunk -> notes,
+//! merge notes until they fit, then one final pass that produces the four required sections.
+//! The user's meeting context (why the meeting is happening) rides in the system prompts.
 
 use std::sync::Arc;
 
 use foundry_local_sdk::{
-    ChatSession, FoundryLocalManager, Item, Model, Request, RequestOptions, SearchOptions,
+    ChatSession, DeviceType, FoundryLocalManager, Item, Model, Request, RequestOptions, SearchOptions,
 };
 
 use crate::transcriber::{load_model, Progress};
 
+/// `chat_model` value meaning "pick the best sub-1 GB model for this machine".
+pub const AUTO: &str = "auto";
+/// Used when an NPU can run it (885 MB NPU build).
+const AUTO_NPU_MODEL: &str = "qwen2.5-1.5b";
+/// Newest chat model under 1 GB; CPU and GPU only.
+const AUTO_FALLBACK_MODEL: &str = "qwen3-0.6b";
+
+/// The NPU variant of [`AUTO_NPU_MODEL`] if this machine can run it: the catalog offers an NPU
+/// build and its execution provider is registered.
+async fn npu_variant(manager: &FoundryLocalManager) -> Option<String> {
+    let registered: Vec<String> =
+        manager.discover_eps().ok()?.into_iter().filter(|e| e.is_registered).map(|e| e.name).collect();
+    let model = manager.catalog().get_model(AUTO_NPU_MODEL).await.ok()?;
+    model
+        .variants()
+        .iter()
+        .filter_map(|v| v.info().ok())
+        .find(|i| {
+            i.runtime
+                .as_ref()
+                .is_some_and(|r| r.device_type == DeviceType::NPU && registered.contains(&r.execution_provider))
+        })
+        .map(|i| i.id)
+}
+
+// Sized for sub-1 GB models, which have a short effective context.
 const CHUNK_CHARS: usize = 5000;
 const FINAL_INPUT_CHARS: usize = 6000;
 const SECTIONS: [&str; 4] = ["## Summary", "## Decisions", "## Action items", "## Open questions"];
@@ -25,6 +51,18 @@ impl Summarizer {
         variant: Option<&str>,
         progress: &Progress,
     ) -> anyhow::Result<Self> {
+        if alias == AUTO {
+            if let Some(id) = npu_variant(manager).await {
+                log::info!("auto chat model: trying NPU variant {id}");
+                match load_model(manager, AUTO_NPU_MODEL, Some(&id), progress).await {
+                    Ok(model) => return Ok(Self { model }),
+                    Err(e) => log::warn!("NPU chat model unusable, falling back to {AUTO_FALLBACK_MODEL}: {e:#}"),
+                }
+            } else {
+                log::info!("auto chat model: no usable NPU variant, using {AUTO_FALLBACK_MODEL}");
+            }
+            return Ok(Self { model: load_model(manager, AUTO_FALLBACK_MODEL, None, progress).await? });
+        }
         Ok(Self { model: load_model(manager, alias, variant, progress).await? })
     }
 
@@ -35,7 +73,10 @@ impl Summarizer {
     }
 
     /// Returns markdown containing exactly the four required `##` sections.
-    pub async fn summarize(&self, transcript: &str) -> anyhow::Result<String> {
+    /// `context` is the user's note on why the meeting is happening (may be empty).
+    pub async fn summarize(&self, transcript: &str, context: &str) -> anyhow::Result<String> {
+        let notes_prompt = with_context(NOTES_PROMPT, context, false);
+        let final_prompt = with_context(FINAL_PROMPT, context, true);
         let mut notes = transcript.to_string();
         let mut round = 0;
         while notes.len() > FINAL_INPUT_CHARS && round < 4 {
@@ -44,15 +85,21 @@ impl Summarizer {
             log::info!("summary round {round}: {} chunks", chunks.len());
             let mut next = Vec::new();
             for chunk in chunks {
-                next.push(self.ask(NOTES_PROMPT, &chunk, 450).await?);
+                next.push(self.ask(&notes_prompt, &chunk, 450).await?);
             }
             notes = next.join("\n");
         }
-        let raw = self.ask(FINAL_PROMPT, &notes, 700).await?;
+        let raw = self.ask(&final_prompt, &notes, 700).await?;
         Ok(normalize(&raw))
     }
 
     async fn ask(&self, system: &str, user: &str, max_tokens: i32) -> anyhow::Result<String> {
+        // Qwen3 reasons in <think> blocks by default; that would eat the token budget.
+        let system = if self.model.alias().starts_with("qwen3") {
+            format!("{system}\n/no_think")
+        } else {
+            system.to_string()
+        };
         let session = ChatSession::new(&self.model).await?;
         let options = RequestOptions {
             search: SearchOptions {
@@ -63,12 +110,22 @@ impl Summarizer {
             ..Default::default()
         };
         let request = Request::from_items(vec![
-            Item::system_message(vec![Item::text(system)]),
+            Item::system_message(vec![Item::text(&system)]),
             Item::user_message(vec![Item::text(user)]),
         ])
         .with_options(options);
-        Ok(session.process_request(request).await?.text())
+        Ok(strip_reasoning(&session.process_request(request).await?.text()))
     }
+}
+
+/// Drop `<think>...</think>` reasoning. An unclosed `<think>` means the reply was cut off
+/// mid-thought, so nothing after it is usable.
+fn strip_reasoning(text: &str) -> String {
+    let after = match text.rfind("</think>") {
+        Some(i) => &text[i + "</think>".len()..],
+        None => text,
+    };
+    after.split("<think>").next().unwrap_or("").trim().to_string()
 }
 
 const NOTES_PROMPT: &str = "You condense part of a meeting transcript into terse bullet notes. \
@@ -81,6 +138,27 @@ Reply in exactly this markdown format and nothing else:\n\
 ## Action items\n- bullet per action item with owner if stated, or - None\n\
 ## Open questions\n- bullet per unresolved question, or - None\n\
 Only use facts stated in the input. Do not invent anything.";
+
+/// Append the user's meeting context to a system prompt. It frames relevance only; it is not
+/// transcript, so it must never become a decision or action item on its own.
+fn with_context(base: &str, context: &str, state_purpose: bool) -> String {
+    let context = context.trim();
+    if context.is_empty() {
+        return base.to_string();
+    }
+    let mut out = format!(
+        "{base}\n\nBackground from the note-taker about this meeting (why it is happening and what \
+they need from it). Use it only to judge what matters and to frame the notes. It is not part of the \
+transcript: never report it as something that was said, and never take decisions or action items \
+from it.\n<background>\n{context}\n</background>"
+    );
+    if state_purpose {
+        out.push_str(
+            "\nIn the Summary, say whether the meeting's stated purpose was met, judging only from the transcript.",
+        );
+    }
+    out
+}
 
 /// Split on line boundaries into pieces of at most `max` chars (a single longer line stays whole).
 fn split(text: &str, max: usize) -> Vec<String> {

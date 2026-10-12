@@ -33,6 +33,8 @@ pub struct Config {
     pub summarize: bool,
     pub keep_chat_loaded: bool,
     pub hotkey: String,
+    /// Toggles dictation into the meeting-context box (only while not recording).
+    pub dictate_hotkey: String,
     pub capture_mode: CaptureMode,
     pub loopback_device: LoopbackDevice,
 }
@@ -45,12 +47,13 @@ impl Default for Config {
             speech_model: "nemotron-speech-streaming-en-0.6b".into(),
             speech_variant: None,
             language: "en".into(),
-            // Smallest chat model that stays under 1 GB on every target machine.
-            chat_model: "qwen2.5-0.5b".into(),
+            // "auto": qwen2.5-1.5b on an NPU (885 MB), else qwen3-0.6b (593 MB CPU / 529 MB GPU).
+            chat_model: crate::summarize::AUTO.into(),
             chat_variant: None,
             summarize: true,
             keep_chat_loaded: true,
             hotkey: "Ctrl+Alt+N".into(),
+            dictate_hotkey: "Ctrl+Alt+D".into(),
             capture_mode: CaptureMode::Dual,
             loopback_device: LoopbackDevice::Default,
         }
@@ -63,16 +66,17 @@ speech_model = "nemotron-speech-streaming-en-0.6b"
 # speech_variant = "nemotron-speech-streaming-en-0.6b-generic-cpu:3"
 language = "en"
 
-# Under 1 GB: qwen2.5-0.5b (700-820 MB, any machine).
-# On the Intel NPU machine you can use a stronger 885 MB model instead:
+# "auto" picks the best model under 1 GB for this machine: qwen2.5-1.5b on an NPU (885 MB),
+# otherwise qwen3-0.6b (CPU/GPU, 529-593 MB). Or name any catalog model, optionally with a variant:
 #   chat_model = "qwen2.5-1.5b"
 #   chat_variant = "qwen2.5-1.5b-instruct-openvino-npu:5"
-chat_model = "qwen2.5-0.5b"
+chat_model = "auto"
 # chat_variant = ""
 summarize = true
-keep_chat_loaded = true
+keep_chat_loaded = true        # false loads the chat model only at summary time
 
 hotkey = "Ctrl+Alt+N"
+dictate_hotkey = "Ctrl+Alt+D"  # toggle dictation of the meeting context (when not recording)
 capture_mode = "dual"          # dual | mixed
 loopback_device = "default"    # default | communications (communications not yet supported)
 "#;
