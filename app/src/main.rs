@@ -322,7 +322,7 @@ impl eframe::App for App {
                 let a = model_combo(ui, "speech", &speech, &mut self.speech_sel, "nemotron-speech-streaming-en-0.6b");
                 ui.add_space(4.0);
                 ui.label("Chat model (summary)");
-                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, "phi-4-mini");
+                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, "qwen3-0.6b");
                 if a || b {
                     self.send(Cmd::ApplyModels { speech: self.speech_sel.clone(), chat: self.chat_sel.clone() });
                 }

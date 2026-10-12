@@ -47,13 +47,12 @@ impl Default for Config {
             speech_model: "nemotron-speech-streaming-en-0.6b".into(),
             speech_variant: None,
             language: "en".into(),
-            // A few-GB model: handles long transcripts and a meeting-context prompt far better
-            // than the 0.5B class. It has CPU, GPU and Intel NPU variants.
-            chat_model: "phi-4-mini".into(),
+            // Newest chat model under 1 GB (593 MB CPU, 529 MB GPU). CPU/GPU only; on an Intel NPU
+            // machine pick qwen2.5-1.5b (885 MB NPU variant) instead.
+            chat_model: "qwen3-0.6b".into(),
             chat_variant: None,
             summarize: true,
-            // Loaded at summary time and unloaded after, so the model's RAM is not held all day.
-            keep_chat_loaded: false,
+            keep_chat_loaded: true,
             hotkey: "Ctrl+Alt+N".into(),
             dictate_hotkey: "Ctrl+Alt+D".into(),
             capture_mode: CaptureMode::Dual,
@@ -68,13 +67,14 @@ speech_model = "nemotron-speech-streaming-en-0.6b"
 # speech_variant = "nemotron-speech-streaming-en-0.6b-generic-cpu:3"
 language = "en"
 
-# phi-4-mini has CPU, GPU and Intel NPU variants. Smaller: qwen2.5-1.5b or qwen2.5-0.5b (<1 GB).
-# Pin a variant to force a device, e.g. the Intel NPU:
-#   chat_variant = "phi-4-mini-instruct-openvino-npu:4"
-chat_model = "phi-4-mini"
+# Newest chat model under 1 GB: qwen3-0.6b (CPU/GPU, 529-593 MB).
+# On the Intel NPU machine you can use a stronger 885 MB model instead:
+#   chat_model = "qwen2.5-1.5b"
+#   chat_variant = "qwen2.5-1.5b-instruct-openvino-npu:5"
+chat_model = "qwen3-0.6b"
 # chat_variant = ""
 summarize = true
-keep_chat_loaded = false       # true keeps the chat model in RAM between meetings
+keep_chat_loaded = true        # false loads the chat model only at summary time
 
 hotkey = "Ctrl+Alt+N"
 dictate_hotkey = "Ctrl+Alt+D"  # toggle dictation of the meeting context (when not recording)

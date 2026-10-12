@@ -10,9 +10,9 @@ use foundry_local_sdk::{
 
 use crate::transcriber::{load_model, Progress};
 
-// Roughly 2k and 2.5k tokens: leaves room for the prompt and reply inside a 4k-token window.
-const CHUNK_CHARS: usize = 8000;
-const FINAL_INPUT_CHARS: usize = 10000;
+// Sized for sub-1 GB models, which have a short effective context.
+const CHUNK_CHARS: usize = 5000;
+const FINAL_INPUT_CHARS: usize = 6000;
 const SECTIONS: [&str; 4] = ["## Summary", "## Decisions", "## Action items", "## Open questions"];
 
 pub struct Summarizer {
@@ -48,15 +48,21 @@ impl Summarizer {
             log::info!("summary round {round}: {} chunks", chunks.len());
             let mut next = Vec::new();
             for chunk in chunks {
-                next.push(self.ask(&notes_prompt, &chunk, 600).await?);
+                next.push(self.ask(&notes_prompt, &chunk, 450).await?);
             }
             notes = next.join("\n");
         }
-        let raw = self.ask(&final_prompt, &notes, 900).await?;
+        let raw = self.ask(&final_prompt, &notes, 700).await?;
         Ok(normalize(&raw))
     }
 
     async fn ask(&self, system: &str, user: &str, max_tokens: i32) -> anyhow::Result<String> {
+        // Qwen3 reasons in <think> blocks by default; that would eat the token budget.
+        let system = if self.model.alias().starts_with("qwen3") {
+            format!("{system}\n/no_think")
+        } else {
+            system.to_string()
+        };
         let session = ChatSession::new(&self.model).await?;
         let options = RequestOptions {
             search: SearchOptions {
@@ -67,12 +73,22 @@ impl Summarizer {
             ..Default::default()
         };
         let request = Request::from_items(vec![
-            Item::system_message(vec![Item::text(system)]),
+            Item::system_message(vec![Item::text(&system)]),
             Item::user_message(vec![Item::text(user)]),
         ])
         .with_options(options);
-        Ok(session.process_request(request).await?.text())
+        Ok(strip_reasoning(&session.process_request(request).await?.text()))
     }
+}
+
+/// Drop `<think>...</think>` reasoning. An unclosed `<think>` means the reply was cut off
+/// mid-thought, so nothing after it is usable.
+fn strip_reasoning(text: &str) -> String {
+    let after = match text.rfind("</think>") {
+        Some(i) => &text[i + "</think>".len()..],
+        None => text,
+    };
+    after.split("<think>").next().unwrap_or("").trim().to_string()
 }
 
 const NOTES_PROMPT: &str = "You condense part of a meeting transcript into terse bullet notes. \
