@@ -34,7 +34,7 @@ The executable is `target\release\MyNoteTaker.exe`. The native `*.dll` files fro
 
 ## Releases
 
-Pushing a tag such as `v0.1.0` runs the GitHub Actions workflow in `.github/workflows/release.yml`. It builds on Windows and attaches `MyNoteTaker-<tag>-windows-x64.zip` to a GitHub Release. The zip contains the exe, the native DLLs and the install scripts, and is never committed to the repo.
+Every push to `main` runs .github/workflows/release.yml. It builds on Windows and publishes a GitHub Release `v<version>.<run number>` with `MyNoteTaker-<tag>-windows-x64.zip` attached (exe, native DLLs, install scripts). The zip is never committed to the repo.
 
 ## Repository layout
 
