@@ -1,6 +1,6 @@
-//! Summary with a small (<1 GB) chat model. A 0.5B-class model has a short effective context,
-//! so long transcripts are reduced hierarchically: chunk -> notes, merge notes until they fit,
-//! then one final pass that produces the four required sections.
+//! Summary with a local chat model. Long transcripts are reduced hierarchically: chunk -> notes,
+//! merge notes until they fit, then one final pass that produces the four required sections.
+//! The user's meeting context (why the meeting is happening) rides in the system prompts.
 
 use std::sync::Arc;
 
@@ -10,8 +10,9 @@ use foundry_local_sdk::{
 
 use crate::transcriber::{load_model, Progress};
 
-const CHUNK_CHARS: usize = 5000;
-const FINAL_INPUT_CHARS: usize = 6000;
+// Roughly 2k and 2.5k tokens: leaves room for the prompt and reply inside a 4k-token window.
+const CHUNK_CHARS: usize = 8000;
+const FINAL_INPUT_CHARS: usize = 10000;
 const SECTIONS: [&str; 4] = ["## Summary", "## Decisions", "## Action items", "## Open questions"];
 
 pub struct Summarizer {
@@ -35,7 +36,10 @@ impl Summarizer {
     }
 
     /// Returns markdown containing exactly the four required `##` sections.
-    pub async fn summarize(&self, transcript: &str) -> anyhow::Result<String> {
+    /// `context` is the user's note on why the meeting is happening (may be empty).
+    pub async fn summarize(&self, transcript: &str, context: &str) -> anyhow::Result<String> {
+        let notes_prompt = with_context(NOTES_PROMPT, context, false);
+        let final_prompt = with_context(FINAL_PROMPT, context, true);
         let mut notes = transcript.to_string();
         let mut round = 0;
         while notes.len() > FINAL_INPUT_CHARS && round < 4 {
@@ -44,11 +48,11 @@ impl Summarizer {
             log::info!("summary round {round}: {} chunks", chunks.len());
             let mut next = Vec::new();
             for chunk in chunks {
-                next.push(self.ask(NOTES_PROMPT, &chunk, 450).await?);
+                next.push(self.ask(&notes_prompt, &chunk, 600).await?);
             }
             notes = next.join("\n");
         }
-        let raw = self.ask(FINAL_PROMPT, &notes, 700).await?;
+        let raw = self.ask(&final_prompt, &notes, 900).await?;
         Ok(normalize(&raw))
     }
 
@@ -81,6 +85,27 @@ Reply in exactly this markdown format and nothing else:\n\
 ## Action items\n- bullet per action item with owner if stated, or - None\n\
 ## Open questions\n- bullet per unresolved question, or - None\n\
 Only use facts stated in the input. Do not invent anything.";
+
+/// Append the user's meeting context to a system prompt. It frames relevance only; it is not
+/// transcript, so it must never become a decision or action item on its own.
+fn with_context(base: &str, context: &str, state_purpose: bool) -> String {
+    let context = context.trim();
+    if context.is_empty() {
+        return base.to_string();
+    }
+    let mut out = format!(
+        "{base}\n\nBackground from the note-taker about this meeting (why it is happening and what \
+they need from it). Use it only to judge what matters and to frame the notes. It is not part of the \
+transcript: never report it as something that was said, and never take decisions or action items \
+from it.\n<background>\n{context}\n</background>"
+    );
+    if state_purpose {
+        out.push_str(
+            "\nIn the Summary, say whether the meeting's stated purpose was met, judging only from the transcript.",
+        );
+    }
+    out
+}
 
 /// Split on line boundaries into pieces of at most `max` chars (a single longer line stays whole).
 fn split(text: &str, max: usize) -> Vec<String> {

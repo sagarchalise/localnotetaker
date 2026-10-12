@@ -32,6 +32,8 @@ pub enum UiState {
 
 pub enum Cmd {
     Toggle,
+    /// Start/stop dictating into the meeting context (idle only).
+    Dictate,
     Quit,
     ApplyModels { speech: String, chat: String },
     SetNotesDir(PathBuf),
@@ -56,6 +58,9 @@ pub struct Shared {
     pub speech_models: Vec<ModelEntry>,
     pub chat_models: Vec<ModelEntry>,
     pub last_note: Option<PathBuf>,
+    /// Why this meeting is happening; typed or dictated, fed to the summarizer, cleared after save.
+    pub context: String,
+    pub dictating: bool,
     pub cfg: Config,
     /// Bumped whenever `cfg` changes outside the user's direct edits (load, apply result).
     pub generation: u64,
@@ -107,6 +112,13 @@ struct Models {
     summarizer: Option<Summarizer>,
 }
 
+/// Dictation into the meeting context: a mic capture feeding one transcription stream.
+struct Dictation {
+    capture: Capture,
+    stream: JoinHandle<()>,
+    collector: JoinHandle<()>,
+}
+
 /// A meeting in progress.
 struct Active {
     captures: Vec<Capture>,
@@ -151,8 +163,35 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
     ui.set_state(UiState::Idle);
 
     let mut active: Option<Active> = None;
+    let mut dictation: Option<Dictation> = None;
     while let Some(cmd) = cmds.recv().await {
+        // Starting a meeting (or quitting) ends any dictation first, so the mic is free.
+        if matches!(cmd, Cmd::Toggle | Cmd::Quit) {
+            if let Some(d) = dictation.take() {
+                stop_dictation(d, ui).await;
+            }
+        }
         match cmd {
+            Cmd::Dictate if active.is_none() => match dictation.take() {
+                Some(d) => {
+                    stop_dictation(d, ui).await;
+                    ui.set_status("Ready");
+                }
+                None => match start_dictation(&models, ui) {
+                    Ok(d) => {
+                        dictation = Some(d);
+                        ui.update(|sh| {
+                            sh.partial.clear();
+                            sh.dictating = true;
+                            sh.status = "Dictating... say why this meeting is happening".into();
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("dictation failed to start: {e:#}");
+                        ui.set_status(format!("Could not start dictation: {e}"));
+                    }
+                },
+            },
             Cmd::Toggle => match active.take() {
                 None => match start_devices(&cfg, &models, ui) {
                     Ok(a) => {
@@ -182,7 +221,7 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 }
                 return;
             }
-            Cmd::ApplyModels { speech, chat } if active.is_none() => {
+            Cmd::ApplyModels { speech, chat } if active.is_none() && dictation.is_none() => {
                 ui.set_state(UiState::Loading);
                 if let Err(e) = apply_models(&mut cfg, &mut models, ui, speech, chat).await {
                     log::error!("applying models failed: {e:#}");
@@ -204,9 +243,41 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 }
                 ui.update(|sh| sh.cfg = cfg.clone());
             }
-            Cmd::ApplyModels { .. } | Cmd::SetNotesDir(_) => {}
+            Cmd::Dictate | Cmd::ApplyModels { .. } | Cmd::SetNotesDir(_) => {}
         }
     }
+}
+
+fn start_dictation(models: &Models, ui: &Ui) -> anyhow::Result<Dictation> {
+    let (tx, rx) = unbounded_channel();
+    let capture = audio::start(Source::Mic, tx).context("opening the microphone")?;
+    let (lines_tx, mut lines_rx) = unbounded_channel::<Line>();
+    let stream = models.transcriber.spawn_stream("Dictation", rx, lines_tx, ui.partial_sink());
+    // Finished utterances are appended to the context box as they arrive.
+    let collector_ui = ui.clone();
+    let collector = tokio::spawn(async move {
+        while let Some(line) = lines_rx.recv().await {
+            collector_ui.update(|sh| {
+                sh.partial.clear();
+                if !sh.context.is_empty() && !sh.context.ends_with(char::is_whitespace) {
+                    sh.context.push(' ');
+                }
+                sh.context.push_str(&line.text);
+            });
+        }
+    });
+    Ok(Dictation { capture, stream, collector })
+}
+
+async fn stop_dictation(d: Dictation, ui: &Ui) {
+    let Dictation { capture, stream, collector } = d;
+    drop(capture); // closes the chunk channel -> the stream flushes its last words and ends
+    let _ = stream.await;
+    let _ = collector.await;
+    ui.update(|sh| {
+        sh.dictating = false;
+        sh.partial.clear();
+    });
 }
 
 /// Show an unrecoverable startup error and wait for the window to ask to quit.
@@ -413,6 +484,7 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
     }
     let (note, transcript) = writer.await.context("transcript writer")?;
     let duration = t0.elapsed();
+    let context = ui.shared.lock().unwrap().context.trim().to_string();
 
     let summary = if !cfg.summarize {
         String::new()
@@ -420,7 +492,7 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
         "## Summary\n(no speech detected)".to_string()
     } else {
         ui.set_status("Summarizing...");
-        match summarize(cfg, models, ui, &transcript.join("\n")).await {
+        match summarize(cfg, models, ui, &transcript.join("\n"), &context).await {
             Ok(s) => s,
             Err(e) => {
                 log::error!("summary failed: {e:#}");
@@ -429,19 +501,29 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
         }
     };
     let path = note.path.clone();
-    note.finish(duration, &summary)?;
+    note.finish(duration, &context, &summary)?;
     log::info!("saved {} ({}s)", path.display(), duration.as_secs());
-    ui.update(|sh| sh.last_note = Some(path));
+    // The context belonged to this meeting; the next one starts blank.
+    ui.update(|sh| {
+        sh.last_note = Some(path);
+        sh.context.clear();
+    });
     Ok(())
 }
 
-async fn summarize(cfg: &Config, models: &Models, ui: &Ui, transcript: &str) -> anyhow::Result<String> {
+async fn summarize(
+    cfg: &Config,
+    models: &Models,
+    ui: &Ui,
+    transcript: &str,
+    context: &str,
+) -> anyhow::Result<String> {
     if let Some(s) = &models.summarizer {
-        return s.summarize(transcript).await;
+        return s.summarize(transcript, context).await;
     }
     // keep_chat_loaded = false: load on demand, unload afterwards.
     let s = Summarizer::load(&models.manager, &cfg.chat_model, cfg.chat_variant.as_deref(), &ui.progress()).await?;
-    let out = s.summarize(transcript).await;
+    let out = s.summarize(transcript, context).await;
     s.unload().await;
     out
 }

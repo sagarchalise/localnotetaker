@@ -64,9 +64,9 @@ impl Note {
         Ok(())
     }
 
-    /// Rewrite with final frontmatter and `summary` (markdown with its own `##` headings)
-    /// placed above the transcript.
-    pub fn finish(self, duration: Duration, summary: &str) -> anyhow::Result<()> {
+    /// Rewrite with final frontmatter, an optional `## Purpose` section (the user's meeting
+    /// context) and `summary` (markdown with its own `##` headings) above the transcript.
+    pub fn finish(self, duration: Duration, purpose: &str, summary: &str) -> anyhow::Result<()> {
         let Note { path, file, started } = self;
         drop(file);
         let text = std::fs::read_to_string(&path)?;
@@ -80,8 +80,12 @@ impl Note {
         let transcript = format!("{}\n", lines.join("\n"));
         let secs = duration.as_secs();
         let dur = format!("{:02}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60);
+        let purpose = match purpose.trim() {
+            "" => String::new(),
+            p => format!("## Purpose\n{p}\n\n"),
+        };
         let out = format!(
-            "{}{}\n\n{TRANSCRIPT_HEADING}\n\n{}",
+            "{}{purpose}{}\n\n{TRANSCRIPT_HEADING}\n\n{}",
             frontmatter(started, &dur),
             summary.trim_end(),
             transcript

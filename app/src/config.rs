@@ -33,6 +33,8 @@ pub struct Config {
     pub summarize: bool,
     pub keep_chat_loaded: bool,
     pub hotkey: String,
+    /// Toggles dictation into the meeting-context box (only while not recording).
+    pub dictate_hotkey: String,
     pub capture_mode: CaptureMode,
     pub loopback_device: LoopbackDevice,
 }
@@ -45,12 +47,15 @@ impl Default for Config {
             speech_model: "nemotron-speech-streaming-en-0.6b".into(),
             speech_variant: None,
             language: "en".into(),
-            // Smallest chat model that stays under 1 GB on every target machine.
-            chat_model: "qwen2.5-0.5b".into(),
+            // A few-GB model: handles long transcripts and a meeting-context prompt far better
+            // than the 0.5B class. It has CPU, GPU and Intel NPU variants.
+            chat_model: "phi-4-mini".into(),
             chat_variant: None,
             summarize: true,
-            keep_chat_loaded: true,
+            // Loaded at summary time and unloaded after, so the model's RAM is not held all day.
+            keep_chat_loaded: false,
             hotkey: "Ctrl+Alt+N".into(),
+            dictate_hotkey: "Ctrl+Alt+D".into(),
             capture_mode: CaptureMode::Dual,
             loopback_device: LoopbackDevice::Default,
         }
@@ -63,16 +68,16 @@ speech_model = "nemotron-speech-streaming-en-0.6b"
 # speech_variant = "nemotron-speech-streaming-en-0.6b-generic-cpu:3"
 language = "en"
 
-# Under 1 GB: qwen2.5-0.5b (700-820 MB, any machine).
-# On the Intel NPU machine you can use a stronger 885 MB model instead:
-#   chat_model = "qwen2.5-1.5b"
-#   chat_variant = "qwen2.5-1.5b-instruct-openvino-npu:5"
-chat_model = "qwen2.5-0.5b"
+# phi-4-mini has CPU, GPU and Intel NPU variants. Smaller: qwen2.5-1.5b or qwen2.5-0.5b (<1 GB).
+# Pin a variant to force a device, e.g. the Intel NPU:
+#   chat_variant = "phi-4-mini-instruct-openvino-npu:4"
+chat_model = "phi-4-mini"
 # chat_variant = ""
 summarize = true
-keep_chat_loaded = true
+keep_chat_loaded = false       # true keeps the chat model in RAM between meetings
 
 hotkey = "Ctrl+Alt+N"
+dictate_hotkey = "Ctrl+Alt+D"  # toggle dictation of the meeting context (when not recording)
 capture_mode = "dual"          # dual | mixed
 loopback_device = "default"    # default | communications (communications not yet supported)
 "#;
