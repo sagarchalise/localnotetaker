@@ -1,0 +1,25 @@
+[package]
+name = "mynotetaker"
+version = "0.1.0"
+edition = "2021"
+description = "MyNoteTaker: local meeting note-taker, live transcription + summary via Foundry Local"
+
+[[bin]]
+name = "MyNoteTaker"
+path = "src/main.rs"
+
+[dependencies]
+foundry-local-sdk.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+anyhow.workspace = true
+cpal = "0.15"
+hound = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = { version = "0.4", features = ["std"] }
+global-hotkey = "0.8"
+eframe = "0.36"
+rfd = "0.17"
+

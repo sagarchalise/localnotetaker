@@ -1,0 +1,10 @@
+[package]
+name = "spike0-catalog"
+version = "0.1.0"
+edition = "2021"
+description = "Spike 0: EP discovery/registration and SDK catalog dump"
+
+[dependencies]
+foundry-local-sdk.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

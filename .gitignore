@@ -1,0 +1,18 @@
+# Build output
+target/
+target-host/
+dist/
+.tools/
+
+# Media, logs and local artifacts
+*.wav
+*.log
+*.png
+*.zip
+*.exe
+*.dll
+spikes/audio/
+spikes/selftest-notes/
+
+# Local tooling config
+.claude/

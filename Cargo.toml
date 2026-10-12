@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "app",
+    "spikes/spike0-catalog",
+    "spikes/spike1-loopback",
+    "spikes/spike2-dual",
+]
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[workspace.dependencies]
+# Latest on crates.io (2.1.0). It has no `winml` feature (1.x did); WinML is bundled in the
+# runtime package. Native DLLs are fetched at build time when FOUNDRY_LOCAL_RUNTIME_VERSION is set
+# (sandbox/build.ps1 does that).
+foundry-local-sdk = "2.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-stream = "0.1"
+anyhow = "1"

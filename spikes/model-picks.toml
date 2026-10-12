@@ -1,0 +1,13 @@
+# Per-machine defaults (starting picks, to be validated in Spike 4)
+# Machine A: RTX 4050 laptop (6 GB VRAM), 24 GB RAM
+speech_model = "nemotron-speech-streaming-en-0.6b"   # CPU only in catalog
+chat_model   = "phi-4-mini"                            # ~3.8B, fits 6 GB VRAM, long context
+chat_variant = "Phi-4-mini-instruct-generic-gpu:5"    # WebGPU; swap for a CUDA variant if it appears on this machine
+keep_chat_loaded = true
+
+# Machine B: Intel NPU laptop, 32 GB RAM
+# speech_model = "nemotron-speech-streaming-en-0.6b"  # CPU only in catalog
+# chat_model   = "phi-4-mini"
+# chat_variant = "phi-4-mini-instruct-openvino-npu:4" # fall back to ...-openvino-gpu:2 if NPU context is too short
+# keep_chat_loaded = true
+# Quality upgrade to test on B (32 GB): qwen2.5-7b via openvino-npu:4 or openvino-gpu:2
