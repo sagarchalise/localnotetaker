@@ -194,18 +194,34 @@ fn model_label(entries: &[ModelEntry], alias: &str) -> String {
 /// Dropdown over catalog entries; returns true if the user picked a different model.
 fn model_combo(ui: &mut egui::Ui, id: &str, entries: &[ModelEntry], selected: &mut String, default: &str) -> bool {
     let before = selected.clone();
-    egui::ComboBox::from_id_salt(id)
+    let filter_id = egui::Id::new((id, "model-filter"));
+    let shown = egui::ComboBox::from_id_salt(id)
         .width(400.0)
         .selected_text(model_label(entries, selected))
         .show_ui(ui, |ui| {
-            for e in entries {
-                let mut label = model_label(entries, &e.alias);
-                if e.alias == default {
-                    label.push_str("  [default]");
+            let mut filter = ui.data_mut(|d| d.get_temp::<String>(filter_id)).unwrap_or_default();
+            ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search models...")).request_focus();
+            let needle = filter.trim().to_lowercase();
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                let mut any = false;
+                for e in entries.iter().filter(|e| e.alias.to_lowercase().contains(&needle)) {
+                    any = true;
+                    let mut label = model_label(entries, &e.alias);
+                    if e.alias == default {
+                        label.push_str("  [default]");
+                    }
+                    ui.selectable_value(selected, e.alias.clone(), label);
                 }
-                ui.selectable_value(selected, e.alias.clone(), label);
-            }
+                if !any {
+                    ui.weak("No models match");
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(filter_id, filter));
         });
+    if shown.inner.is_none() {
+        // Popup closed: the next open starts with an empty search.
+        ui.data_mut(|d| d.remove::<String>(filter_id));
+    }
     *selected != before
 }
 
