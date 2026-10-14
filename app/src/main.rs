@@ -362,7 +362,12 @@ impl eframe::App for App {
             });
             if let Some(p) = last_note {
                 ui.separator();
-                ui.small(format!("Note: {}", p.display()));
+                ui.horizontal(|ui| {
+                    ui.small(format!("Note: {}", p.display()));
+                    if ui.small_button("Open").clicked() {
+                        let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                    }
+                });
             }
         });
     }
