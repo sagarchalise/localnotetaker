@@ -1,7 +1,8 @@
-# Local release build that the desktop shortcut runs:
-#   target\x86_64-pc-windows-msvc\release\MyNoteTaker.exe
+# Local release build, deployed to a fixed folder the desktop shortcut points at:
+#   %LOCALAPPDATA%\Programs\MyNoteTaker\MyNoteTaker.exe (same place installer\install.ps1 uses)
+# The shortcut never points into target\, so cargo clean or a new build can't break it.
 # Run after any change: powershell -ExecutionPolicy Bypass -File scripts\build-local.ps1
-# Uses the normal MSVC toolchain when link.exe is available; otherwise the xwin SDK in .tools
+# Uses the normal MSVC toolchain when installed (VS Build Tools, C++ workload); otherwise the xwin SDK in .tools
 # with LLVM (clang-cl) and lld-link (winget install LLVM.LLVM).
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -9,7 +10,11 @@ Set-Location $root
 $env:FOUNDRY_LOCAL_RUNTIME_VERSION = '2.1.0'
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+# cargo locates an installed MSVC toolchain itself, so link.exe needn't be on PATH.
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$hasMsvc = (Get-Command link.exe -ErrorAction SilentlyContinue) -or ((Test-Path $vswhere) -and
+  (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath))
+if (-not $hasMsvc) {
   $splat = Join-Path $root '.tools\xwin-splat'
   $llvm = 'C:\Program Files\LLVM\bin'
   if (-not (Test-Path $splat) -or -not (Test-Path $llvm)) {
@@ -42,4 +47,20 @@ $out = Get-ChildItem "$release\build" -Directory -Filter 'foundry-local-sdk-*' |
   Sort-Object { (Get-Item "$_\foundry_local.dll").LastWriteTime } -Descending |
   Select-Object -First 1
 if ($out) { Copy-Item "$out\*.dll" $release -Force }
-Get-Item "$release\MyNoteTaker.exe" | Select-Object FullName, Length, LastWriteTime
+
+# Deploy over the previous build in place, then (re)write the shortcuts so they always exist
+# and point at the same exe.
+$dest = Join-Path $env:LOCALAPPDATA 'Programs\MyNoteTaker'
+New-Item -ItemType Directory -Force $dest | Out-Null
+Copy-Item "$release\MyNoteTaker.exe", "$release\*.dll" $dest -Force
+Copy-Item "$root\installer\uninstall.ps1" $dest -Force
+$exe = Join-Path $dest 'MyNoteTaker.exe'
+$shell = New-Object -ComObject WScript.Shell
+foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {
+  $lnk = $shell.CreateShortcut((Join-Path $dir 'MyNoteTaker.lnk'))
+  $lnk.TargetPath = $exe
+  $lnk.WorkingDirectory = $dest
+  $lnk.IconLocation = "$exe,0"
+  $lnk.Save()
+}
+Get-Item $exe | Select-Object FullName, Length, LastWriteTime
