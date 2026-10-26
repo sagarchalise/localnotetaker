@@ -10,7 +10,7 @@ mod transcriber;
 mod whisper;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use eframe::egui;
@@ -194,6 +194,37 @@ fn model_label(entries: &[ModelEntry], alias: &str) -> String {
     }
 }
 
+/// Show a folder, or open a note in its viewer. Anything else (an .exe typed into the folder box,
+/// say) is refused: Explorer would run it, and this app never runs anything.
+fn open_in_explorer(path: &Path) {
+    let is_note = path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"));
+    if !(path.is_dir() || is_note) {
+        log::warn!("not opening {}: not a folder or .md note", path.display());
+        return;
+    }
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+fn eps_label<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let labels: Vec<String> = names.into_iter().map(|n| backend::ep_label(n.trim())).collect();
+    if labels.is_empty() { "CPU".into() } else { labels.join(" + ") }
+}
+
+/// `eps`: providers this machine offers (empty until the backend has discovered them).
+fn accel_label(accel: &str, eps: &[String]) -> String {
+    match accel {
+        a if a == config::ACCEL_AUTO && eps.is_empty() => "auto  (recommended: best for this machine)".into(),
+        a if a == config::ACCEL_AUTO => format!("auto  (recommended: {})", eps_label(backend::auto_eps(eps))),
+        a if a == config::ACCEL_ALL => "all available  (slowest first launch)".into(),
+        a if a == config::ACCEL_CPU => "CPU only  (fastest start, slower models)".into(),
+        list => eps_label(list.split(',')),
+    }
+}
+
+fn mm_ss(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
 /// Dropdown over catalog entries; returns true if the user picked a different model.
 fn model_combo(ui: &mut egui::Ui, id: &str, entries: &[ModelEntry], selected: &mut String, default: &str) -> bool {
     let before = selected.clone();
@@ -232,16 +263,20 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
-        let (state, dictating, status, partial, recent, speech, chat, last_note, cfg, generation) = {
+        let (state, dictating, status, download, hint, step_started, partial, recent, speech, chat, eps, last_note, cfg, generation) = {
             let s = self.ui.shared.lock().unwrap();
             (
                 s.state,
                 s.dictating,
                 s.status.clone(),
+                s.download,
+                s.hint.clone(),
+                s.step_started,
                 s.partial.clone(),
                 s.recent.clone(),
                 s.speech_models.clone(),
                 s.chat_models.clone(),
+                s.eps.clone(),
                 s.last_note.clone(),
                 s.cfg.clone(),
                 s.generation,
@@ -280,17 +315,44 @@ impl eframe::App for App {
                 (UiState::Recording, _) => "RECORDING".to_string(),
                 _ => status.clone(),
             };
+            let busy = matches!(state, UiState::Loading | UiState::Summarizing) || self.closing;
             let color = match state {
                 UiState::Recording => egui::Color32::from_rgb(220, 50, 50),
                 UiState::Error => egui::Color32::from_rgb(220, 120, 40),
+                UiState::Loading => egui::Color32::from_rgb(70, 140, 230),
                 _ => ui.visuals().text_color(),
             };
-            ui.colored_label(color, status_text);
+            ui.horizontal(|ui| {
+                if busy {
+                    ui.spinner();
+                }
+                ui.colored_label(color, status_text);
+                if let Some(t0) = step_started.filter(|_| busy) {
+                    let elapsed = t0.elapsed();
+                    let mut timing = format!("elapsed {}", mm_ss(elapsed.as_secs()));
+                    // Linear ETA once enough of the download has arrived to estimate from.
+                    if let Some(f) = download.filter(|f| *f > 0.02 && *f < 1.0) {
+                        let left = elapsed.as_secs_f32() * (1.0 - f) / f;
+                        timing.push_str(&format!(", about {} left", mm_ss(left as u64)));
+                    }
+                    ui.weak(timing);
+                }
+            });
+            // Model download: a real bar so a multi-GB fetch doesn't look like a hang.
+            if let Some(f) = download {
+                ui.add(egui::ProgressBar::new(f).desired_width(380.0).show_percentage().animate(true));
+            }
+            if busy && !hint.is_empty() {
+                ui.small(hint);
+            }
             ui.add_space(8.0);
 
             let (label, enabled) = match state {
                 UiState::Recording => ("Stop recording (saves and summarizes)", !self.closing),
                 UiState::Idle => ("Start recording", true),
+                UiState::Loading if download.is_some() => ("Downloading model...", false),
+                UiState::Loading => ("Loading model...", false),
+                UiState::Summarizing => ("Summarizing...", false),
                 _ => ("Please wait...", false),
             };
             let button = egui::Button::new(egui::RichText::new(label).size(18.0)).min_size(egui::vec2(380.0, 48.0));
@@ -308,8 +370,15 @@ impl eframe::App for App {
                     egui::TextEdit::multiline(&mut shared.context)
                         .desired_width(f32::INFINITY)
                         .desired_rows(3)
+                        .char_limit(summarize::CONTEXT_MAX_CHARS)
                         .hint_text("e.g. Weekly sync to settle the launch date and unblock the API migration"),
                 );
+                ui.small(format!(
+                    "{}/{} characters, about one paragraph. Plain description only; it is never run as code \
+                     and instructions in it are ignored.",
+                    shared.context.chars().count(),
+                    summarize::CONTEXT_MAX_CHARS
+                ));
             }
             ui.horizontal(|ui| {
                 let label = if dictating { "Stop dictating" } else { "Dictate context" };
@@ -320,6 +389,29 @@ impl eframe::App for App {
             });
 
             ui.separator();
+            // Usable during the startup it slows down; takes effect from the next launch.
+            ui.label("Hardware acceleration (applies on next start)");
+            let mut accel = cfg.accelerator.clone();
+            egui::ComboBox::from_id_salt("accelerator")
+                .width(400.0)
+                .selected_text(accel_label(&accel, &eps))
+                .show_ui(ui, |ui| {
+                    let mut options: Vec<String> =
+                        [config::ACCEL_AUTO, config::ACCEL_ALL, config::ACCEL_CPU].map(String::from).into();
+                    options.extend(eps.iter().cloned());
+                    if !options.contains(&accel) {
+                        options.push(accel.clone()); // a hand-edited list from config.toml
+                    }
+                    for o in options {
+                        let label = accel_label(&o, &eps);
+                        ui.selectable_value(&mut accel, o, label);
+                    }
+                });
+            if accel != cfg.accelerator {
+                self.send(Cmd::SetAccelerator(accel));
+            }
+
+            ui.add_space(4.0);
             ui.add_enabled_ui(idle && !dictating, |ui| {
                 ui.label("Speech model (live transcription)");
                 let a = model_combo(ui, "speech", &speech, &mut self.speech_sel, "nemotron-speech-streaming-en-0.6b");
@@ -346,7 +438,7 @@ impl eframe::App for App {
                     }
                     if ui.button("Open").clicked() {
                         let _ = std::fs::create_dir_all(&self.folder);
-                        let _ = std::process::Command::new("explorer").arg(&self.folder).spawn();
+                        open_in_explorer(Path::new(&self.folder));
                     }
                 });
             });
@@ -365,7 +457,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.small(format!("Note: {}", p.display()));
                     if ui.small_button("Open").clicked() {
-                        let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                        open_in_explorer(&p);
                     }
                 });
             }

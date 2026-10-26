@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use crate::audio::{self, Capture, Source};
 use crate::config::{self, CaptureMode, Config, LoopbackDevice};
 use crate::notes::{Line, Note};
-use crate::summarize::Summarizer;
+use crate::summarize::{self, Summarizer};
 use crate::transcriber::{self, PartialSink, Progress, Transcriber};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +37,8 @@ pub enum Cmd {
     Quit,
     ApplyModels { speech: String, chat: String },
     SetNotesDir(PathBuf),
+    /// Saved now, used from the next start (registered providers can't be dropped at runtime).
+    SetAccelerator(String),
 }
 
 /// A catalog model offered in a dropdown.
@@ -52,11 +54,19 @@ pub struct ModelEntry {
 pub struct Shared {
     pub state: UiState,
     pub status: String,
+    /// Fraction (0..=1) of the model download in progress, if any.
+    pub download: Option<f32>,
+    /// Plain-language explanation of the step in `status`, with what to expect; empty when idle.
+    pub hint: String,
+    /// When the current long-running step began (for elapsed time and download ETA).
+    pub step_started: Option<Instant>,
     pub partial: String,
     /// Most recent finished transcript lines (newest last).
     pub recent: Vec<String>,
     pub speech_models: Vec<ModelEntry>,
     pub chat_models: Vec<ModelEntry>,
+    /// Execution providers Foundry Local can use on this machine.
+    pub eps: Vec<String>,
     pub last_note: Option<PathBuf>,
     /// Why this meeting is happening; typed or dictated, fed to the summarizer, cleared after save.
     pub context: String,
@@ -90,12 +100,38 @@ impl Ui {
 
     fn set_status(&self, text: impl Into<String>) {
         let text = text.into();
-        self.update(|sh| sh.status = text);
+        self.update(|sh| {
+            sh.status = text;
+            sh.download = None;
+            sh.hint.clear();
+            sh.step_started = None;
+        });
+    }
+
+    /// A long-running step: status plus an explanation, timed from now.
+    fn set_step(&self, text: impl Into<String>, hint: &str) {
+        let text = text.into();
+        self.update(|sh| {
+            sh.status = text;
+            sh.download = None;
+            sh.hint = hint.to_string();
+            sh.step_started = Some(Instant::now());
+        });
     }
 
     fn progress(&self) -> Progress {
         let ui = self.clone();
-        Arc::new(move |t| ui.set_status(t))
+        Arc::new(move |text, fraction| {
+            let hint = if fraction.is_some() { HINT_DOWNLOAD } else { HINT_LOAD };
+            ui.update(|sh| {
+                if sh.hint != hint {
+                    sh.hint = hint.to_string();
+                    sh.step_started = Some(Instant::now());
+                }
+                sh.status = text;
+                sh.download = fraction;
+            })
+        })
     }
 
     fn partial_sink(&self) -> PartialSink {
@@ -103,6 +139,14 @@ impl Ui {
         Arc::new(move |t| ui.update(|sh| sh.partial = t))
     }
 }
+
+const HINT_ENGINE: &str = "Starting Foundry Local, the on-device AI runtime. Usually a few seconds.";
+const HINT_EPS: &str = "Looking for an NPU or GPU and setting up the drivers that let models run on it \
+    (falls back to CPU). The first launch may download these and take a minute or two; later launches are quick.";
+const HINT_DOWNLOAD: &str = "One-time download of the model; it is kept on disk and reused afterwards.";
+const HINT_LOAD: &str = "Loading the model into memory. Usually 5-30 seconds, longer for big models.";
+const HINT_SUMMARY: &str = "The local chat model is reading the transcript and writing the summary. \
+    Longer meetings take longer; the transcript is already saved.";
 
 /// Models that stay loaded for the app's lifetime.
 struct Models {
@@ -127,6 +171,71 @@ struct Active {
     t0: Instant,
 }
 
+/// Download (first time only) and register the execution providers `cfg.accelerator` asks for.
+/// Ones already registered are skipped; failures leave the models on CPU.
+async fn register_eps(manager: &FoundryLocalManager, cfg: &Config, ui: &Ui) {
+    let available = match manager.discover_eps() {
+        Ok(eps) => eps,
+        Err(e) => return log::warn!("EP discovery failed (continuing on CPU): {e}"),
+    };
+    ui.update(|sh| sh.eps = available.iter().map(|e| e.name.clone()).collect());
+    let all: Vec<String> = available.iter().map(|e| e.name.clone()).collect();
+    let wanted: Vec<&str> = match cfg.accelerator.trim() {
+        a if a.eq_ignore_ascii_case(config::ACCEL_CPU) => Vec::new(),
+        a if a.eq_ignore_ascii_case(config::ACCEL_ALL) => all.iter().map(String::as_str).collect(),
+        a if a.is_empty() || a.eq_ignore_ascii_case(config::ACCEL_AUTO) => auto_eps(&all),
+        list => list.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
+    };
+    let names: Vec<&str> =
+        wanted.into_iter().filter(|w| available.iter().any(|e| e.name == *w && !e.is_registered)).collect();
+    log::info!("accelerator={:?}; registering [{}]", cfg.accelerator, names.join(","));
+    if names.is_empty() {
+        return;
+    }
+    let what = if names.len() == 1 { ep_label(names[0]) } else { format!("{} providers", names.len()) };
+    ui.set_step(format!("Setting up hardware acceleration: {what}..."), HINT_EPS);
+    let progress_ui = ui.clone();
+    let result = manager
+        .download_and_register_eps_with_progress(Some(&names), move |ep, pct| {
+            progress_ui.update(|sh| {
+                sh.status = format!("Setting up {}: {pct:.0}%", ep_label(ep));
+                sh.download = Some((pct / 100.0).clamp(0.0, 1.0) as f32);
+            })
+        })
+        .await;
+    match result {
+        Ok(r) => log::info!("EPs: registered=[{}] failed=[{}]", r.registered_eps.join(","), r.failed_eps.join(",")),
+        Err(e) => log::warn!("EP registration failed (continuing on CPU): {e}"),
+    }
+}
+
+/// The "auto" choice: one NPU provider and one GPU provider at most, so the first launch fetches
+/// what this machine will actually use instead of every provider on offer. Dedicated vendor
+/// providers win; OpenVINO (Intel GPU/NPU) or a generic GPU path only when there is none.
+pub fn auto_eps(available: &[String]) -> Vec<&str> {
+    let first = |prefs: &[&'static str]| prefs.iter().copied().find(|p| available.iter().any(|a| a == p));
+    let npu = first(&["QNNExecutionProvider", "VitisAIExecutionProvider"]);
+    let gpu = first(&["CUDAExecutionProvider", "NvTensorRTRTXExecutionProvider", "MIGraphXExecutionProvider"])
+        .or_else(|| first(&["OpenVINOExecutionProvider", "DmlExecutionProvider", "WebGpuExecutionProvider"]));
+    npu.into_iter().chain(gpu).collect()
+}
+
+/// Human name for an execution provider id.
+pub fn ep_label(name: &str) -> String {
+    let friendly = match name {
+        "CUDAExecutionProvider" => "NVIDIA GPU (CUDA)",
+        "NvTensorRTRTXExecutionProvider" => "NVIDIA RTX GPU (TensorRT)",
+        "OpenVINOExecutionProvider" => "Intel CPU/GPU/NPU (OpenVINO)",
+        "WebGpuExecutionProvider" => "Any GPU (WebGPU)",
+        "DmlExecutionProvider" => "Any GPU (DirectML)",
+        "QNNExecutionProvider" => "Qualcomm NPU (QNN)",
+        "VitisAIExecutionProvider" => "AMD NPU (Vitis AI)",
+        "MIGraphXExecutionProvider" => "AMD GPU (MIGraphX)",
+        other => return other.trim_end_matches("ExecutionProvider").to_string(),
+    };
+    friendly.to_string()
+}
+
 pub async fn run(cfg: Config, ui: Ui, cmds: UnboundedReceiver<Cmd>) {
     run_inner(cfg, &ui, cmds).await;
     ui.set_state(UiState::Exited);
@@ -134,17 +243,12 @@ pub async fn run(cfg: Config, ui: Ui, cmds: UnboundedReceiver<Cmd>) {
 
 async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
     ui.set_state(UiState::Loading);
-    ui.set_status("Starting engine...");
+    ui.set_step("Starting engine...", HINT_ENGINE);
     let manager = match transcriber::create_manager() {
         Ok(m) => m,
         Err(e) => return fail(ui, &mut cmds, format!("Engine start failed: {e}")).await,
     };
-    // WinML execution providers (NPU/GPU) are discovered and registered at runtime.
-    ui.set_status("Registering execution providers...");
-    match manager.download_and_register_eps(None).await {
-        Ok(r) => log::info!("EPs: registered=[{}] failed=[{}]", r.registered_eps.join(","), r.failed_eps.join(",")),
-        Err(e) => log::warn!("EP registration failed (continuing on CPU): {e}"),
-    }
+    register_eps(&manager, &cfg, ui).await;
     refresh_models(&manager, ui).await;
 
     let mut models = match load_models(&manager, &cfg, ui).await {
@@ -158,8 +262,8 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
     ui.update(|sh| {
         sh.cfg = cfg.clone();
         sh.generation += 1;
-        sh.status = "Ready".into();
     });
+    ui.set_status("Ready");
     ui.set_state(UiState::Idle);
 
     let mut active: Option<Active> = None;
@@ -243,6 +347,13 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 }
                 ui.update(|sh| sh.cfg = cfg.clone());
             }
+            Cmd::SetAccelerator(acc) => {
+                cfg.accelerator = acc;
+                if let Err(e) = config::save(&cfg) {
+                    log::error!("saving config: {e:#}");
+                }
+                ui.update(|sh| sh.cfg = cfg.clone());
+            }
             Cmd::Dictate | Cmd::ApplyModels { .. } | Cmd::SetNotesDir(_) => {}
         }
     }
@@ -263,6 +374,10 @@ fn start_dictation(models: &Models, ui: &Ui) -> anyhow::Result<Dictation> {
                     sh.context.push(' ');
                 }
                 sh.context.push_str(&line.text);
+                // Same cap as typing: about a paragraph.
+                if sh.context.chars().count() > summarize::CONTEXT_MAX_CHARS {
+                    sh.context = summarize::clean_context(&sh.context);
+                }
             });
         }
     });
@@ -485,14 +600,14 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
     }
     let (note, transcript) = writer.await.context("transcript writer")?;
     let duration = t0.elapsed();
-    let context = ui.shared.lock().unwrap().context.trim().to_string();
+    let context = summarize::clean_context(&ui.shared.lock().unwrap().context);
 
     let summary = if !cfg.summarize {
         String::new()
     } else if transcript.is_empty() {
         "## Summary\n(no speech detected)".to_string()
     } else {
-        ui.set_status("Summarizing...");
+        ui.set_step("Summarizing...", HINT_SUMMARY);
         match summarize(cfg, models, ui, &transcript.join("\n"), &context).await {
             Ok(s) => s,
             Err(e) => {
@@ -524,6 +639,7 @@ async fn summarize(
     }
     // keep_chat_loaded = false: load on demand, unload afterwards.
     let s = Summarizer::load(&models.manager, &cfg.chat_model, cfg.chat_variant.as_deref(), &ui.progress()).await?;
+    ui.set_step("Summarizing...", HINT_SUMMARY);
     let out = s.summarize(transcript, context).await;
     s.unload().await;
     out
@@ -534,7 +650,7 @@ async fn summarize(
 pub async fn selftest(cfg: Config, me: &Path, them: &Path) -> anyhow::Result<()> {
     let ui = Ui::new(cfg.clone(), || {});
     let manager = transcriber::create_manager()?;
-    let _ = manager.download_and_register_eps(None).await;
+    register_eps(&manager, &cfg, &ui).await;
     let models = load_models(&manager, &cfg, &ui).await?;
     let mut inputs = Vec::new();
     let mut feeders = Vec::new();

@@ -24,8 +24,8 @@ const IDLE_FLUSH: Duration = Duration::from_millis(1500);
 const PARTIAL_EVERY: Duration = Duration::from_millis(500);
 
 pub type PartialSink = Arc<dyn Fn(String) + Send + Sync>;
-/// Status text for the UI ("Downloading ... 40%").
-pub type Progress = Arc<dyn Fn(String) + Send + Sync>;
+/// Status text for the UI ("Downloading ... 40%") and the download fraction (0..=1) while one runs.
+pub type Progress = Arc<dyn Fn(String, Option<f32>) + Send + Sync>;
 
 /// Resolve an alias (optionally pinning a variant), download if needed, and load it.
 pub async fn load_model(
@@ -40,11 +40,12 @@ pub async fn load_model(
     }
     if !model.is_cached().await? {
         log::info!("downloading {alias}");
+        progress(format!("Downloading {alias}..."), Some(0.0));
         let (name, progress) = (alias.to_string(), progress.clone());
         let mut last = -5.0;
         model
             .download(Some(move |p: f64| {
-                progress(format!("Downloading {name}: {p:.0}%"));
+                progress(format!("Downloading {name}: {p:.0}%"), Some((p / 100.0).clamp(0.0, 1.0) as f32));
                 if p - last >= 10.0 {
                     last = p;
                     log::info!("  {name}: {p:.0}%");
@@ -52,7 +53,7 @@ pub async fn load_model(
             }))
             .await?;
     }
-    progress(format!("Loading {alias}..."));
+    progress(format!("Loading {alias}..."), None);
     let t = Instant::now();
     model.load().await?;
     log::info!("{alias} ({}) loaded in {:.1}s", model.id(), t.elapsed().as_secs_f64());

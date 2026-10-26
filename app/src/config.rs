@@ -21,6 +21,13 @@ pub enum LoopbackDevice {
     Communications,
 }
 
+/// `accelerator` value: pick the best NPU/GPU provider for this machine.
+pub const ACCEL_AUTO: &str = "auto";
+/// `accelerator` value: register every execution provider this machine offers (slow first start).
+pub const ACCEL_ALL: &str = "all";
+/// `accelerator` value: register none; models run on CPU.
+pub const ACCEL_CPU: &str = "cpu";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -37,6 +44,8 @@ pub struct Config {
     pub dictate_hotkey: String,
     pub capture_mode: CaptureMode,
     pub loopback_device: LoopbackDevice,
+    /// "auto", "all", "cpu", or comma-separated execution provider names (e.g. "CUDAExecutionProvider").
+    pub accelerator: String,
 }
 
 impl Default for Config {
@@ -56,6 +65,7 @@ impl Default for Config {
             dictate_hotkey: "Ctrl+Alt+D".into(),
             capture_mode: CaptureMode::Dual,
             loopback_device: LoopbackDevice::Default,
+            accelerator: ACCEL_AUTO.into(),
         }
     }
 }
@@ -79,6 +89,11 @@ hotkey = "Ctrl+Alt+N"
 dictate_hotkey = "Ctrl+Alt+D"  # toggle dictation of the meeting context (when not recording)
 capture_mode = "dual"          # dual | mixed
 loopback_device = "default"    # default | communications (communications not yet supported)
+
+# Hardware acceleration set up at start. "auto" picks the best NPU/GPU provider for this machine;
+# "all" downloads every provider on offer (slow first launch); "cpu" skips them; or name the
+# ones you want, comma-separated, e.g. accelerator = "CUDAExecutionProvider"
+accelerator = "auto"
 "#;
 
 pub fn app_dir() -> PathBuf {
