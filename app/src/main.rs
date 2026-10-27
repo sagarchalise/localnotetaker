@@ -480,6 +480,11 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     ui.label("Chat model (summary)");
                     b = model_combo(ui, "chat", &chat, &mut self.chat_sel, summarize::AUTO);
+                    let mut keep = cfg.keep_chat_loaded;
+                    ui.checkbox(&mut keep, "Keep chat model loaded (faster summaries, uses more memory)");
+                    if keep != cfg.keep_chat_loaded {
+                        self.send(Cmd::SetKeepChatLoaded(keep));
+                    }
                 } else {
                     ui.small("Base URL, e.g. http://localhost:11434/v1 (Ollama), http://localhost:1234/v1 (LM Studio)");
                     ui.add(egui::TextEdit::singleline(&mut self.api_url).desired_width(400.0));

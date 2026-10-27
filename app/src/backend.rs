@@ -49,6 +49,8 @@ pub enum Cmd {
     },
     /// Save (Some) or clear (None) the encrypted API key, then rebuild the summarizer.
     SetChatApiKey(Option<String>),
+    /// Keep the chat model resident (true) or load it only at summary time (false).
+    SetKeepChatLoaded(bool),
     SetNotesDir(PathBuf),
     /// Saved now, used from the next start (registered providers can't be dropped at runtime).
     SetAccelerator(String),
@@ -395,6 +397,21 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 });
                 ui.set_state(UiState::Idle);
             }
+            Cmd::SetKeepChatLoaded(keep) if active.is_none() && dictation.is_none() => {
+                ui.set_state(UiState::Loading);
+                match set_keep_chat_loaded(&mut cfg, &mut models, ui, keep).await {
+                    Ok(()) => ui.set_status("Ready"),
+                    Err(e) => {
+                        log::error!("changing keep_chat_loaded failed: {e:#}");
+                        ui.set_status(format!("Chat model change failed: {e}"));
+                    }
+                }
+                ui.update(|sh| {
+                    sh.cfg = cfg.clone();
+                    sh.generation += 1;
+                });
+                ui.set_state(UiState::Idle);
+            }
             Cmd::SetNotesDir(dir) if active.is_none() => {
                 cfg.notes_dir = dir;
                 if let Err(e) = config::save(&cfg) {
@@ -413,6 +430,7 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
             | Cmd::ApplyModels { .. }
             | Cmd::SetChatProvider { .. }
             | Cmd::SetChatApiKey(_)
+            | Cmd::SetKeepChatLoaded(_)
             | Cmd::SetNotesDir(_) => {}
         }
     }
@@ -600,6 +618,23 @@ async fn set_chat_api_key(cfg: &mut Config, models: &mut Models, ui: &Ui, key: O
     if cfg.chat_provider == ChatProvider::OpenAi && cfg.summarize && cfg.keep_chat_loaded {
         models.summarizer = Some(Summarizer::from_config(&models.manager, cfg, &ui.progress()).await?);
     }
+    Ok(())
+}
+
+/// Load the chat model now and keep it, or unload it until the next summary. A failed load leaves
+/// the setting unchanged.
+async fn set_keep_chat_loaded(cfg: &mut Config, models: &mut Models, ui: &Ui, keep: bool) -> anyhow::Result<()> {
+    let mut next = cfg.clone();
+    next.keep_chat_loaded = keep;
+    if keep && next.summarize && models.summarizer.is_none() {
+        models.summarizer = Some(Summarizer::from_config(&models.manager, &next, &ui.progress()).await?);
+    } else if !keep {
+        if let Some(old) = models.summarizer.take() {
+            old.unload().await;
+        }
+    }
+    config::save(&next)?;
+    *cfg = next;
     Ok(())
 }
 
