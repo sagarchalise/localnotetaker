@@ -79,7 +79,7 @@ impl Default for Config {
             chat_model: crate::summarize::AUTO.into(),
             chat_variant: None,
             summarize: true,
-            keep_chat_loaded: true,
+            keep_chat_loaded: false,
             chat_provider: ChatProvider::Foundry,
             chat_base_url: "http://localhost:11434/v1".into(),
             chat_api_model: String::new(),
@@ -107,7 +107,7 @@ language = "en"
 chat_model = "auto"
 # chat_variant = ""
 summarize = true
-keep_chat_loaded = true        # false loads the chat model only at summary time
+keep_chat_loaded = false       # true keeps the chat model in memory for faster summaries
 
 # Summary provider: "foundry" (local, default) or "openai" (any OpenAI-compatible endpoint). With
 # "openai" the transcript text is sent to that endpoint; transcription always stays on this machine.
