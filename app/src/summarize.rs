@@ -119,6 +119,12 @@ impl Summarizer {
             let key = std::env::var(key_env).ok().filter(|k| !k.trim().is_empty());
             Some(key.with_context(|| format!("environment variable {key_env} (chat_api_key_env) is not set"))?)
         };
+        // A key over plain http would cross the network unencrypted.
+        anyhow::ensure!(
+            api_key.is_none() || parsed.scheme() == "https" || is_local_endpoint(&base_url),
+            "chat_base_url must use https to send an API key to {}",
+            endpoint_host(&base_url)
+        );
         let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build().context("building HTTP client")?;
         log::info!("summaries go to {} (model {model})", endpoint_host(&base_url));
         let (chunk_chars, final_input_chars) = budgets(cfg.chat_provider, cfg.chat_max_input_chars);
