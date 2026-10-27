@@ -95,7 +95,7 @@ impl Segmenter {
         let speech_len = self.buf.len().saturating_sub(self.silent_frames * FRAME);
         let samples = std::mem::take(&mut self.buf);
         self.silent_frames = 0;
-        (speech_len >= MIN_SPEECH_SAMPLES).then(|| Segment { start: self.started, samples })
+        (speech_len >= MIN_SPEECH_SAMPLES).then_some(Segment { start: self.started, samples })
     }
 
     fn finish(&mut self) -> Option<Segment> {

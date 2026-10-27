@@ -21,6 +21,15 @@ pub enum LoopbackDevice {
     Communications,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatProvider {
+    /// Local model through Foundry Local.
+    Foundry,
+    /// Any OpenAI-compatible `/chat/completions` endpoint (Ollama, LM Studio, OpenAI, OpenRouter...).
+    OpenAi,
+}
+
 /// `accelerator` value: pick the best NPU/GPU provider for this machine.
 pub const ACCEL_AUTO: &str = "auto";
 /// `accelerator` value: register every execution provider this machine offers (slow first start).
@@ -39,6 +48,16 @@ pub struct Config {
     pub chat_variant: Option<String>,
     pub summarize: bool,
     pub keep_chat_loaded: bool,
+    /// Where summaries are written: local Foundry model, or any OpenAI-compatible endpoint.
+    pub chat_provider: ChatProvider,
+    /// OpenAI-compatible base URL, without `/chat/completions`.
+    pub chat_base_url: String,
+    /// Model name sent to the endpoint; required when `chat_provider = "openai"`.
+    pub chat_api_model: String,
+    /// Name of an environment variable holding the API key (never the key itself); empty = no key.
+    pub chat_api_key_env: String,
+    /// Overrides the final-pass input budget in characters (default 6000 Foundry, 100000 HTTP).
+    pub chat_max_input_chars: Option<usize>,
     pub hotkey: String,
     /// Toggles dictation into the meeting-context box (only while not recording).
     pub dictate_hotkey: String,
@@ -61,6 +80,11 @@ impl Default for Config {
             chat_variant: None,
             summarize: true,
             keep_chat_loaded: true,
+            chat_provider: ChatProvider::Foundry,
+            chat_base_url: "http://localhost:11434/v1".into(),
+            chat_api_model: String::new(),
+            chat_api_key_env: String::new(),
+            chat_max_input_chars: None,
             hotkey: "Ctrl+Alt+N".into(),
             dictate_hotkey: "Ctrl+Alt+D".into(),
             capture_mode: CaptureMode::Dual,
@@ -85,6 +109,19 @@ chat_model = "auto"
 summarize = true
 keep_chat_loaded = true        # false loads the chat model only at summary time
 
+# Summary provider: "foundry" (local, default) or "openai" (any OpenAI-compatible endpoint). With
+# "openai" the transcript text is sent to that endpoint; transcription always stays on this machine.
+# The API key is read from the environment variable named by chat_api_key_env, never stored here.
+chat_provider = "foundry"
+# Ollama:     chat_base_url = "http://localhost:11434/v1"
+# LM Studio:  chat_base_url = "http://localhost:1234/v1"
+# OpenAI:     chat_base_url = "https://api.openai.com/v1"   chat_api_key_env = "OPENAI_API_KEY"
+# OpenRouter: chat_base_url = "https://openrouter.ai/api/v1" chat_api_key_env = "OPENROUTER_API_KEY"
+chat_base_url = "http://localhost:11434/v1"
+chat_api_model = ""            # required for "openai", e.g. "llama3.1:8b" or "gpt-4o-mini"
+chat_api_key_env = ""          # empty = no Authorization header
+# chat_max_input_chars = 100000  # final-pass input budget; longer transcripts are condensed in chunks
+
 hotkey = "Ctrl+Alt+N"
 dictate_hotkey = "Ctrl+Alt+D"  # toggle dictation of the meeting context (when not recording)
 capture_mode = "dual"          # dual | mixed
@@ -97,10 +134,7 @@ accelerator = "auto"
 "#;
 
 pub fn app_dir() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("MyNoteTaker")
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("MyNoteTaker")
 }
 
 /// Persist the config (comments from the first-run template are not preserved).

@@ -3,11 +3,15 @@
 //! The user's meeting context (why the meeting is happening) rides in the system prompts.
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
 
 use foundry_local_sdk::{
     ChatSession, DeviceType, FoundryLocalManager, Item, Model, Request, RequestOptions, SearchOptions,
 };
 
+use crate::config::{ChatProvider, Config};
 use crate::transcriber::{load_model, Progress};
 
 /// `chat_model` value meaning "pick the best sub-1 GB model for this machine".
@@ -36,15 +40,95 @@ async fn npu_variant(manager: &FoundryLocalManager) -> Option<String> {
 }
 
 // Sized for sub-1 GB models, which have a short effective context.
-const CHUNK_CHARS: usize = 5000;
-const FINAL_INPUT_CHARS: usize = 6000;
+const FOUNDRY_CHUNK_CHARS: usize = 5000;
+const FOUNDRY_FINAL_INPUT_CHARS: usize = 6000;
+/// Hosted models take whole meetings in one pass.
+const HTTP_FINAL_INPUT_CHARS: usize = 100_000;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const SECTIONS: [&str; 4] = ["## Summary", "## Decisions", "## Action items", "## Open questions"];
 
+enum Backend {
+    Foundry { model: Arc<Model> },
+    Http { client: reqwest::Client, base_url: String, model: String, api_key: Option<String> },
+}
+
 pub struct Summarizer {
-    model: Arc<Model>,
+    backend: Backend,
+    /// Piece size when reducing a long transcript.
+    chunk_chars: usize,
+    /// Longest input for the final pass; anything longer is condensed first.
+    final_input_chars: usize,
+}
+
+/// `(chunk, final-pass)` input budgets in chars: the override if set (chunk = budget), else the
+/// provider default.
+fn budgets(provider: ChatProvider, max_input: Option<usize>) -> (usize, usize) {
+    match (max_input, provider) {
+        (Some(n), _) => (n, n),
+        (None, ChatProvider::Foundry) => (FOUNDRY_CHUNK_CHARS, FOUNDRY_FINAL_INPUT_CHARS),
+        (None, ChatProvider::OpenAi) => (HTTP_FINAL_INPUT_CHARS, HTTP_FINAL_INPUT_CHARS),
+    }
+}
+
+/// True if the URL points at this machine (localhost, 127.x, ::1), so nothing leaves it.
+pub fn is_local_endpoint(url: &str) -> bool {
+    let Some(u) = reqwest::Url::parse(url).ok() else {
+        return false;
+    };
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Host (and port) of an endpoint URL, for logs and the UI; never includes credentials.
+pub fn endpoint_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| format!("{h}{}", u.port().map(|p| format!(":{p}")).unwrap_or_default())))
+        .unwrap_or_else(|| "an invalid endpoint".into())
 }
 
 impl Summarizer {
+    /// Build the summarizer the config asks for. The Foundry path loads (and may download) the model.
+    pub async fn from_config(manager: &FoundryLocalManager, cfg: &Config, progress: &Progress) -> anyhow::Result<Self> {
+        match cfg.chat_provider {
+            ChatProvider::Foundry => {
+                let mut s = Self::load(manager, &cfg.chat_model, cfg.chat_variant.as_deref(), progress).await?;
+                (s.chunk_chars, s.final_input_chars) = budgets(cfg.chat_provider, cfg.chat_max_input_chars);
+                Ok(s)
+            }
+            ChatProvider::OpenAi => Self::http(cfg),
+        }
+    }
+
+    fn http(cfg: &Config) -> anyhow::Result<Self> {
+        let model = cfg.chat_api_model.trim();
+        anyhow::ensure!(!model.is_empty(), "chat_api_model is empty; name the model your endpoint serves");
+        let base_url = cfg.chat_base_url.trim().trim_end_matches('/').to_string();
+        let parsed = reqwest::Url::parse(&base_url).with_context(|| format!("chat_base_url {base_url:?}"))?;
+        anyhow::ensure!(matches!(parsed.scheme(), "http" | "https"), "chat_base_url must be http or https");
+        // A key saved in the app wins; the environment variable is the fallback.
+        let key_env = cfg.chat_api_key_env.trim();
+        let api_key = if let Some(key) = crate::secret::load_api_key()? {
+            Some(key)
+        } else if key_env.is_empty() {
+            None
+        } else {
+            let key = std::env::var(key_env).ok().filter(|k| !k.trim().is_empty());
+            Some(key.with_context(|| format!("environment variable {key_env} (chat_api_key_env) is not set"))?)
+        };
+        let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build().context("building HTTP client")?;
+        log::info!("summaries go to {} (model {model})", endpoint_host(&base_url));
+        let (chunk_chars, final_input_chars) = budgets(cfg.chat_provider, cfg.chat_max_input_chars);
+        Ok(Self {
+            backend: Backend::Http { client, base_url, model: model.to_string(), api_key },
+            chunk_chars,
+            final_input_chars,
+        })
+    }
+
     pub async fn load(
         manager: &FoundryLocalManager,
         alias: &str,
@@ -55,20 +139,28 @@ impl Summarizer {
             if let Some(id) = npu_variant(manager).await {
                 log::info!("auto chat model: trying NPU variant {id}");
                 match load_model(manager, AUTO_NPU_MODEL, Some(&id), progress).await {
-                    Ok(model) => return Ok(Self { model }),
+                    Ok(model) => return Ok(Self::foundry(model)),
                     Err(e) => log::warn!("NPU chat model unusable, falling back to {AUTO_FALLBACK_MODEL}: {e:#}"),
                 }
             } else {
                 log::info!("auto chat model: no usable NPU variant, using {AUTO_FALLBACK_MODEL}");
             }
-            return Ok(Self { model: load_model(manager, AUTO_FALLBACK_MODEL, None, progress).await? });
+            return Ok(Self::foundry(load_model(manager, AUTO_FALLBACK_MODEL, None, progress).await?));
         }
-        Ok(Self { model: load_model(manager, alias, variant, progress).await? })
+        Ok(Self::foundry(load_model(manager, alias, variant, progress).await?))
     }
 
+    fn foundry(model: Arc<Model>) -> Self {
+        let (chunk_chars, final_input_chars) = budgets(ChatProvider::Foundry, None);
+        Self { backend: Backend::Foundry { model }, chunk_chars, final_input_chars }
+    }
+
+    /// No-op for an HTTP endpoint: nothing is loaded here.
     pub async fn unload(&self) {
-        if let Err(e) = self.model.unload().await {
-            log::warn!("unloading chat model: {e}");
+        if let Backend::Foundry { model } = &self.backend {
+            if let Err(e) = model.unload().await {
+                log::warn!("unloading chat model: {e}");
+            }
         }
     }
 
@@ -79,9 +171,9 @@ impl Summarizer {
         let final_prompt = with_context(FINAL_PROMPT, context, true);
         let mut notes = transcript.to_string();
         let mut round = 0;
-        while notes.len() > FINAL_INPUT_CHARS && round < 4 {
+        while notes.len() > self.final_input_chars && round < 4 {
             round += 1;
-            let chunks = split(&notes, CHUNK_CHARS);
+            let chunks = split(&notes, self.chunk_chars);
             log::info!("summary round {round}: {} chunks", chunks.len());
             let mut next = Vec::new();
             for chunk in chunks {
@@ -94,28 +186,74 @@ impl Summarizer {
     }
 
     async fn ask(&self, system: &str, user: &str, max_tokens: i32) -> anyhow::Result<String> {
-        // Qwen3 reasons in <think> blocks by default; that would eat the token budget.
-        let system = if self.model.alias().starts_with("qwen3") {
-            format!("{system}\n/no_think")
-        } else {
-            system.to_string()
-        };
-        let session = ChatSession::new(&self.model).await?;
-        let options = RequestOptions {
-            search: SearchOptions {
-                temperature: Some(0.2),
-                max_output_tokens: Some(max_tokens),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let request = Request::from_items(vec![
-            Item::system_message(vec![Item::text(&system)]),
-            Item::user_message(vec![Item::text(user)]),
-        ])
-        .with_options(options);
-        Ok(strip_reasoning(&session.process_request(request).await?.text()))
+        match &self.backend {
+            Backend::Foundry { model } => ask_foundry(model, system, user, max_tokens).await,
+            Backend::Http { client, base_url, model, api_key } => {
+                ask_http(client, base_url, model, api_key.as_deref(), system, user, max_tokens).await
+            }
+        }
     }
+}
+
+async fn ask_foundry(model: &Arc<Model>, system: &str, user: &str, max_tokens: i32) -> anyhow::Result<String> {
+    // Qwen3 reasons in <think> blocks by default; that would eat the token budget.
+    let system = if model.alias().starts_with("qwen3") { format!("{system}\n/no_think") } else { system.to_string() };
+    let session = ChatSession::new(model).await?;
+    let options = RequestOptions {
+        search: SearchOptions { temperature: Some(0.2), max_output_tokens: Some(max_tokens), ..Default::default() },
+        ..Default::default()
+    };
+    let request = Request::from_items(vec![
+        Item::system_message(vec![Item::text(&system)]),
+        Item::user_message(vec![Item::text(user)]),
+    ])
+    .with_options(options);
+    Ok(strip_reasoning(&session.process_request(request).await?.text()))
+}
+
+async fn ask_http(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    system: &str,
+    user: &str,
+    max_tokens: i32,
+) -> anyhow::Result<String> {
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    });
+    let mut req = client.post(format!("{base_url}/chat/completions")).json(&body);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let host = endpoint_host(base_url);
+    let resp = req.send().await.with_context(|| format!("calling {host}"))?;
+    let status = resp.status();
+    let text = resp.text().await.with_context(|| format!("reading response from {host}"))?;
+    anyhow::ensure!(status.is_success(), "{host} returned HTTP {status}: {}", snippet(&text));
+    parse_chat_response(&text).with_context(|| format!("response from {host}"))
+}
+
+/// First 200 chars of a response body, for error messages.
+fn snippet(text: &str) -> String {
+    text.trim().chars().take(200).collect()
+}
+
+/// The reply text from an OpenAI-style chat completion body, minus any reasoning block.
+fn parse_chat_response(body: &str) -> anyhow::Result<String> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("not valid JSON ({e}): {}", snippet(body)))?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no choices[0].message.content: {}", snippet(body)))?;
+    Ok(strip_reasoning(content))
 }
 
 /// Drop `<think>...</think>` reasoning. An unclosed `<think>` means the reply was cut off
@@ -229,4 +367,79 @@ fn section(raw: &str, heading: &str, next: Option<&str>) -> Option<String> {
     let end = next.and_then(|n| rest.find(n)).unwrap_or(rest.len());
     let body = rest[..end].trim();
     (!body.is_empty()).then(|| body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_endpoints() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.1.2.3/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(is_local_endpoint(url), "{url}");
+        }
+        for url in [
+            "https://api.openai.com/v1",
+            "http://192.168.1.5:11434/v1",
+            "http://localhost.evil.com/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://[2001:db8::1]/v1",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_local_endpoint(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn host_for_display() {
+        assert_eq!(endpoint_host("https://user:secret@api.openai.com/v1"), "api.openai.com");
+        assert_eq!(endpoint_host("http://localhost:11434/v1"), "localhost:11434");
+    }
+
+    #[test]
+    fn parses_chat_response() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"<think>hm</think>\n## Summary\nok"}}]}"#;
+        assert_eq!(parse_chat_response(body).unwrap(), "## Summary\nok");
+    }
+
+    #[test]
+    fn rejects_bad_chat_responses() {
+        assert!(parse_chat_response("nope").unwrap_err().to_string().contains("not valid JSON"));
+        let e = parse_chat_response(r#"{"error":{"message":"bad key"}}"#).unwrap_err().to_string();
+        assert!(e.contains("bad key"), "{e}");
+        assert!(parse_chat_response(r#"{"choices":[]}"#).is_err());
+        assert!(parse_chat_response(r#"{"choices":[{"message":{"content":null}}]}"#).is_err());
+    }
+
+    #[test]
+    fn budget_selection() {
+        assert_eq!(budgets(ChatProvider::Foundry, None), (5000, 6000));
+        assert_eq!(budgets(ChatProvider::OpenAi, None), (100_000, 100_000));
+        assert_eq!(budgets(ChatProvider::Foundry, Some(8000)), (8000, 8000));
+        assert_eq!(budgets(ChatProvider::OpenAi, Some(30_000)), (30_000, 30_000));
+    }
+
+    #[test]
+    fn http_requires_model() {
+        let cfg = Config { chat_provider: ChatProvider::OpenAi, ..Config::default() };
+        assert!(Summarizer::http(&cfg).err().unwrap().to_string().contains("chat_api_model"));
+    }
+
+    #[test]
+    fn http_requires_set_key_env() {
+        let cfg = Config {
+            chat_provider: ChatProvider::OpenAi,
+            chat_api_model: "m".into(),
+            chat_api_key_env: "MYNOTETAKER_TEST_UNSET_KEY".into(),
+            ..Config::default()
+        };
+        assert!(Summarizer::http(&cfg).err().unwrap().to_string().contains("MYNOTETAKER_TEST_UNSET_KEY"));
+    }
 }

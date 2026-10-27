@@ -5,6 +5,7 @@ mod backend;
 mod config;
 mod hotkey;
 mod notes;
+mod secret;
 mod summarize;
 mod transcriber;
 mod whisper;
@@ -18,6 +19,7 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use backend::{Cmd, ModelEntry, Ui, UiState};
+use config::ChatProvider;
 
 struct FileLogger(Mutex<std::fs::File>);
 
@@ -85,13 +87,11 @@ fn main() -> anyhow::Result<()> {
             let ui = Ui::new(cfg.clone(), move || ctx.request_repaint());
             let (cmd_tx, cmd_rx) = unbounded_channel::<Cmd>();
             let backend_ui = ui.clone();
-            std::thread::Builder::new().name("backend".into()).spawn(move || {
-                match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt.block_on(backend::run(cfg, backend_ui.clone(), cmd_rx)),
-                    Err(e) => {
-                        log::error!("tokio runtime: {e}");
-                        backend_ui.update(|s| s.state = UiState::Exited);
-                    }
+            std::thread::Builder::new().name("backend".into()).spawn(move || match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(backend::run(cfg, backend_ui.clone(), cmd_rx)),
+                Err(e) => {
+                    log::error!("tokio runtime: {e}");
+                    backend_ui.update(|s| s.state = UiState::Exited);
                 }
             })?;
 
@@ -146,6 +146,13 @@ struct App {
     dictate_label: String,
     speech_sel: String,
     chat_sel: String,
+    provider_sel: ChatProvider,
+    api_url: String,
+    api_model: String,
+    api_key_env: String,
+    /// Key being typed; cleared as soon as it is sent.
+    api_key_input: String,
+    api_key_saved: bool,
     folder: String,
     /// `Shared::generation` last synced into the selections above.
     seen_generation: u64,
@@ -168,6 +175,12 @@ impl App {
             dictate_label,
             speech_sel: String::new(),
             chat_sel: String::new(),
+            provider_sel: ChatProvider::Foundry,
+            api_url: String::new(),
+            api_model: String::new(),
+            api_key_env: String::new(),
+            api_key_input: String::new(),
+            api_key_saved: false,
             folder: String::new(),
             seen_generation: u64::MAX,
             closing: false,
@@ -176,6 +189,13 @@ impl App {
 
     fn send(&self, cmd: Cmd) {
         let _ = self.cmd_tx.send(cmd);
+    }
+}
+
+fn provider_label(p: ChatProvider) -> &'static str {
+    match p {
+        ChatProvider::Foundry => "Foundry Local (on this machine)",
+        ChatProvider::OpenAi => "OpenAI-compatible endpoint",
     }
 }
 
@@ -207,14 +227,20 @@ fn open_in_explorer(path: &Path) {
 
 fn eps_label<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     let labels: Vec<String> = names.into_iter().map(|n| backend::ep_label(n.trim())).collect();
-    if labels.is_empty() { "CPU".into() } else { labels.join(" + ") }
+    if labels.is_empty() {
+        "CPU".into()
+    } else {
+        labels.join(" + ")
+    }
 }
 
 /// `eps`: providers this machine offers (empty until the backend has discovered them).
 fn accel_label(accel: &str, eps: &[String]) -> String {
     match accel {
         a if a == config::ACCEL_AUTO && eps.is_empty() => "auto  (recommended: best for this machine)".into(),
-        a if a == config::ACCEL_AUTO => format!("auto  (recommended: {})", eps_label(backend::auto_eps(eps))),
+        a if a == config::ACCEL_AUTO => {
+            format!("auto  (recommended: {})", eps_label(backend::auto_eps(eps)))
+        }
         a if a == config::ACCEL_ALL => "all available  (slowest first launch)".into(),
         a if a == config::ACCEL_CPU => "CPU only  (fastest start, slower models)".into(),
         list => eps_label(list.split(',')),
@@ -229,10 +255,8 @@ fn mm_ss(secs: u64) -> String {
 fn model_combo(ui: &mut egui::Ui, id: &str, entries: &[ModelEntry], selected: &mut String, default: &str) -> bool {
     let before = selected.clone();
     let filter_id = egui::Id::new((id, "model-filter"));
-    let shown = egui::ComboBox::from_id_salt(id)
-        .width(400.0)
-        .selected_text(model_label(entries, selected))
-        .show_ui(ui, |ui| {
+    let shown =
+        egui::ComboBox::from_id_salt(id).width(400.0).selected_text(model_label(entries, selected)).show_ui(ui, |ui| {
             let mut filter = ui.data_mut(|d| d.get_temp::<String>(filter_id)).unwrap_or_default();
             ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search models...")).request_focus();
             let needle = filter.trim().to_lowercase();
@@ -263,7 +287,22 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
-        let (state, dictating, status, download, hint, step_started, partial, recent, speech, chat, eps, last_note, cfg, generation) = {
+        let (
+            state,
+            dictating,
+            status,
+            download,
+            hint,
+            step_started,
+            partial,
+            recent,
+            speech,
+            chat,
+            eps,
+            last_note,
+            cfg,
+            generation,
+        ) = {
             let s = self.ui.shared.lock().unwrap();
             (
                 s.state,
@@ -304,6 +343,11 @@ impl eframe::App for App {
             self.seen_generation = generation;
             self.speech_sel = cfg.speech_model.clone();
             self.chat_sel = cfg.chat_model.clone();
+            self.provider_sel = cfg.chat_provider;
+            self.api_url = cfg.chat_base_url.clone();
+            self.api_model = cfg.chat_api_model.clone();
+            self.api_key_env = cfg.chat_api_key_env.clone();
+            self.api_key_saved = secret::has_api_key();
             self.folder = cfg.notes_dir.to_string_lossy().to_string();
         }
 
@@ -360,6 +404,12 @@ impl eframe::App for App {
                 self.send(Cmd::Toggle);
             }
             ui.small(format!("Global hotkey: {}", self.hotkey_label));
+            if cfg.summarize && cfg.chat_provider == ChatProvider::OpenAi && !summarize::is_local_endpoint(&cfg.chat_base_url) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 120, 40),
+                    format!("Summaries are sent to {}", summarize::endpoint_host(&cfg.chat_base_url)),
+                );
+            }
 
             ui.separator();
             ui.label("Meeting context (why this meeting is happening; focuses the summary)");
@@ -416,8 +466,63 @@ impl eframe::App for App {
                 ui.label("Speech model (live transcription)");
                 let a = model_combo(ui, "speech", &speech, &mut self.speech_sel, "nemotron-speech-streaming-en-0.6b");
                 ui.add_space(4.0);
-                ui.label("Chat model (summary)");
-                let b = model_combo(ui, "chat", &chat, &mut self.chat_sel, summarize::AUTO);
+                ui.label("Summary provider");
+                egui::ComboBox::from_id_salt("provider")
+                    .width(400.0)
+                    .selected_text(provider_label(self.provider_sel))
+                    .show_ui(ui, |ui| {
+                        for p in [ChatProvider::Foundry, ChatProvider::OpenAi] {
+                            ui.selectable_value(&mut self.provider_sel, p, provider_label(p));
+                        }
+                    });
+                let mut b = false;
+                if self.provider_sel == ChatProvider::Foundry {
+                    ui.add_space(4.0);
+                    ui.label("Chat model (summary)");
+                    b = model_combo(ui, "chat", &chat, &mut self.chat_sel, summarize::AUTO);
+                } else {
+                    ui.small("Base URL, e.g. http://localhost:11434/v1 (Ollama), http://localhost:1234/v1 (LM Studio)");
+                    ui.add(egui::TextEdit::singleline(&mut self.api_url).desired_width(400.0));
+                    ui.small("Model name");
+                    ui.add(egui::TextEdit::singleline(&mut self.api_model).desired_width(400.0));
+                    ui.small("Environment variable holding the API key (empty for none)");
+                    ui.add(egui::TextEdit::singleline(&mut self.api_key_env).desired_width(400.0));
+                    ui.small(if self.api_key_saved {
+                        "API key: saved (encrypted for this Windows user on this machine)"
+                    } else {
+                        "API key: none saved (or set the variable above)"
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.api_key_input).password(true).desired_width(280.0),
+                        );
+                        let can_save = !self.api_key_input.trim().is_empty();
+                        if ui.add_enabled(can_save, egui::Button::new("Save key")).clicked() {
+                            let key = std::mem::take(&mut self.api_key_input);
+                            self.send(Cmd::SetChatApiKey(Some(key)));
+                        }
+                        if ui.add_enabled(self.api_key_saved, egui::Button::new("Clear key")).clicked() {
+                            self.send(Cmd::SetChatApiKey(None));
+                        }
+                    });
+                    if ui.button("Apply").clicked() {
+                        self.send(Cmd::SetChatProvider {
+                            provider: self.provider_sel,
+                            base_url: self.api_url.clone(),
+                            api_model: self.api_model.clone(),
+                            api_key_env: self.api_key_env.clone(),
+                        });
+                    }
+                    ui.small("The transcript text is sent to this endpoint for the summary. Transcription stays on this machine.");
+                }
+                if self.provider_sel == ChatProvider::Foundry && cfg.chat_provider != ChatProvider::Foundry {
+                    self.send(Cmd::SetChatProvider {
+                        provider: ChatProvider::Foundry,
+                        base_url: cfg.chat_base_url.clone(),
+                        api_model: cfg.chat_api_model.clone(),
+                        api_key_env: cfg.chat_api_key_env.clone(),
+                    });
+                }
                 if a || b {
                     self.send(Cmd::ApplyModels { speech: self.speech_sel.clone(), chat: self.chat_sel.clone() });
                 }
