@@ -13,8 +13,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 use crate::audio::{self, Capture, Source};
-use crate::config::{self, CaptureMode, Config, LoopbackDevice};
+use crate::config::{self, CaptureMode, ChatProvider, Config, LoopbackDevice};
 use crate::notes::{Line, Note};
+use crate::secret;
 use crate::summarize::{self, Summarizer};
 use crate::transcriber::{self, PartialSink, Progress, Transcriber};
 
@@ -35,7 +36,19 @@ pub enum Cmd {
     /// Start/stop dictating into the meeting context (idle only).
     Dictate,
     Quit,
-    ApplyModels { speech: String, chat: String },
+    ApplyModels {
+        speech: String,
+        chat: String,
+    },
+    /// Switch the summary provider (and its endpoint settings); the old one stays if the new fails.
+    SetChatProvider {
+        provider: ChatProvider,
+        base_url: String,
+        api_model: String,
+        api_key_env: String,
+    },
+    /// Save (Some) or clear (None) the encrypted API key, then rebuild the summarizer.
+    SetChatApiKey(Option<String>),
     SetNotesDir(PathBuf),
     /// Saved now, used from the next start (registered providers can't be dropped at runtime).
     SetAccelerator(String),
@@ -145,8 +158,14 @@ const HINT_EPS: &str = "Looking for an NPU or GPU and setting up the drivers tha
     (falls back to CPU). The first launch may download these and take a minute or two; later launches are quick.";
 const HINT_DOWNLOAD: &str = "One-time download of the model; it is kept on disk and reused afterwards.";
 const HINT_LOAD: &str = "Loading the model into memory. Usually 5-30 seconds, longer for big models.";
-const HINT_SUMMARY: &str = "The local chat model is reading the transcript and writing the summary. \
-    Longer meetings take longer; the transcript is already saved.";
+/// Plain-language note for the summary step, honest about where the transcript goes.
+fn hint_summary(cfg: &Config) -> String {
+    let who = match cfg.chat_provider {
+        ChatProvider::Foundry => "The local chat model".to_string(),
+        ChatProvider::OpenAi => format!("The chat model at {}", summarize::endpoint_host(&cfg.chat_base_url)),
+    };
+    format!("{who} is reading the transcript and writing the summary. Longer meetings take longer; the transcript is already saved.")
+}
 
 /// Models that stay loaded for the app's lifetime.
 struct Models {
@@ -276,26 +295,28 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
             }
         }
         match cmd {
-            Cmd::Dictate if active.is_none() => match dictation.take() {
-                Some(d) => {
-                    stop_dictation(d, ui).await;
-                    ui.set_status("Ready");
+            Cmd::Dictate | Cmd::ApplyModels { .. } | Cmd::SetChatProvider { .. } if active.is_none() => {
+                match dictation.take() {
+                    Some(d) => {
+                        stop_dictation(d, ui).await;
+                        ui.set_status("Ready");
+                    }
+                    None => match start_dictation(&models, ui) {
+                        Ok(d) => {
+                            dictation = Some(d);
+                            ui.update(|sh| {
+                                sh.partial.clear();
+                                sh.dictating = true;
+                                sh.status = "Dictating... say why this meeting is happening".into();
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("dictation failed to start: {e:#}");
+                            ui.set_status(format!("Could not start dictation: {e}"));
+                        }
+                    },
                 }
-                None => match start_dictation(&models, ui) {
-                    Ok(d) => {
-                        dictation = Some(d);
-                        ui.update(|sh| {
-                            sh.partial.clear();
-                            sh.dictating = true;
-                            sh.status = "Dictating... say why this meeting is happening".into();
-                        });
-                    }
-                    Err(e) => {
-                        log::error!("dictation failed to start: {e:#}");
-                        ui.set_status(format!("Could not start dictation: {e}"));
-                    }
-                },
-            },
+            }
             Cmd::Toggle => match active.take() {
                 None => match start_devices(&cfg, &models, ui) {
                     Ok(a) => {
@@ -340,6 +361,40 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 });
                 ui.set_state(UiState::Idle);
             }
+            Cmd::SetChatProvider { provider, base_url, api_model, api_key_env }
+                if active.is_none() && dictation.is_none() =>
+            {
+                ui.set_state(UiState::Loading);
+                let res =
+                    set_chat_provider(&mut cfg, &mut models, ui, provider, base_url, api_model, api_key_env).await;
+                match res {
+                    Ok(()) => ui.set_status("Ready"),
+                    Err(e) => {
+                        log::error!("changing chat provider failed: {e:#}");
+                        ui.set_status(format!("Chat provider change failed: {e}"));
+                    }
+                }
+                ui.update(|sh| {
+                    sh.cfg = cfg.clone();
+                    sh.generation += 1;
+                });
+                ui.set_state(UiState::Idle);
+            }
+            Cmd::SetChatApiKey(key) if active.is_none() && dictation.is_none() => {
+                ui.set_state(UiState::Loading);
+                match set_chat_api_key(&mut cfg, &mut models, ui, key).await {
+                    Ok(()) => ui.set_status("Ready"),
+                    Err(e) => {
+                        log::error!("saving chat API key failed: {e:#}");
+                        ui.set_status(format!("API key change failed: {e}"));
+                    }
+                }
+                ui.update(|sh| {
+                    sh.cfg = cfg.clone();
+                    sh.generation += 1;
+                });
+                ui.set_state(UiState::Idle);
+            }
             Cmd::SetNotesDir(dir) if active.is_none() => {
                 cfg.notes_dir = dir;
                 if let Err(e) = config::save(&cfg) {
@@ -354,7 +409,11 @@ async fn run_inner(mut cfg: Config, ui: &Ui, mut cmds: UnboundedReceiver<Cmd>) {
                 }
                 ui.update(|sh| sh.cfg = cfg.clone());
             }
-            Cmd::Dictate | Cmd::ApplyModels { .. } | Cmd::SetNotesDir(_) => {}
+            Cmd::Dictate
+            | Cmd::ApplyModels { .. }
+            | Cmd::SetChatProvider { .. }
+            | Cmd::SetChatApiKey(_)
+            | Cmd::SetNotesDir(_) => {}
         }
     }
 }
@@ -456,11 +515,7 @@ async fn load_models(manager: &Arc<FoundryLocalManager>, cfg: &Config, ui: &Ui) 
         .await
         .context("speech model")?;
     let summarizer = if cfg.summarize && cfg.keep_chat_loaded {
-        Some(
-            Summarizer::load(manager, &cfg.chat_model, cfg.chat_variant.as_deref(), &progress)
-                .await
-                .context("chat model")?,
-        )
+        Some(Summarizer::from_config(manager, cfg, &progress).await.context("chat model")?)
     } else {
         None
     };
@@ -485,7 +540,8 @@ async fn apply_models(
         next.speech_model = speech;
         next.speech_variant = None; // a pinned variant belongs to the old alias
     }
-    if chat != cfg.chat_model {
+    // The model picker only applies to the local provider.
+    if chat != cfg.chat_model && cfg.chat_provider == ChatProvider::Foundry {
         let new = Summarizer::load(&models.manager, &chat, None, &progress).await?;
         if cfg.summarize && cfg.keep_chat_loaded {
             if let Some(old) = models.summarizer.replace(new) {
@@ -499,6 +555,51 @@ async fn apply_models(
     }
     config::save(&next)?;
     *cfg = next;
+    Ok(())
+}
+
+/// Rebuild the summarizer for a new provider/endpoint. The old one stays until the new one is
+/// ready, so a bad URL, empty model or missing key variable changes nothing.
+async fn set_chat_provider(
+    cfg: &mut Config,
+    models: &mut Models,
+    ui: &Ui,
+    provider: ChatProvider,
+    base_url: String,
+    api_model: String,
+    api_key_env: String,
+) -> anyhow::Result<()> {
+    let mut next = cfg.clone();
+    next.chat_provider = provider;
+    next.chat_base_url = base_url.trim().to_string();
+    next.chat_api_model = api_model.trim().to_string();
+    next.chat_api_key_env = api_key_env.trim().to_string();
+    let new = Summarizer::from_config(&models.manager, &next, &ui.progress()).await?;
+    if next.summarize && next.keep_chat_loaded {
+        if let Some(old) = models.summarizer.replace(new) {
+            old.unload().await;
+        }
+    } else {
+        new.unload().await; // validated (and downloaded); built again at summary time
+        if let Some(old) = models.summarizer.take() {
+            old.unload().await;
+        }
+    }
+    config::save(&next)?;
+    *cfg = next;
+    Ok(())
+}
+
+/// Store (or clear) the encrypted API key and rebuild the summarizer with it. A bad rebuild leaves
+/// the old summarizer running; the key change itself is kept, since it is what the user asked for.
+async fn set_chat_api_key(cfg: &mut Config, models: &mut Models, ui: &Ui, key: Option<String>) -> anyhow::Result<()> {
+    match key {
+        Some(k) => secret::save_api_key(k.trim())?,
+        None => secret::clear_api_key()?,
+    }
+    if cfg.chat_provider == ChatProvider::OpenAi && cfg.summarize && cfg.keep_chat_loaded {
+        models.summarizer = Some(Summarizer::from_config(&models.manager, cfg, &ui.progress()).await?);
+    }
     Ok(())
 }
 
@@ -607,7 +708,7 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
     } else if transcript.is_empty() {
         "## Summary\n(no speech detected)".to_string()
     } else {
-        ui.set_step("Summarizing...", HINT_SUMMARY);
+        ui.set_step("Summarizing...", &hint_summary(cfg));
         match summarize(cfg, models, ui, &transcript.join("\n"), &context).await {
             Ok(s) => s,
             Err(e) => {
@@ -627,19 +728,13 @@ async fn stop_and_write(cfg: &Config, models: &Models, a: Active, ui: &Ui) -> an
     Ok(())
 }
 
-async fn summarize(
-    cfg: &Config,
-    models: &Models,
-    ui: &Ui,
-    transcript: &str,
-    context: &str,
-) -> anyhow::Result<String> {
+async fn summarize(cfg: &Config, models: &Models, ui: &Ui, transcript: &str, context: &str) -> anyhow::Result<String> {
     if let Some(s) = &models.summarizer {
         return s.summarize(transcript, context).await;
     }
     // keep_chat_loaded = false: load on demand, unload afterwards.
-    let s = Summarizer::load(&models.manager, &cfg.chat_model, cfg.chat_variant.as_deref(), &ui.progress()).await?;
-    ui.set_step("Summarizing...", HINT_SUMMARY);
+    let s = Summarizer::from_config(&models.manager, cfg, &ui.progress()).await?;
+    ui.set_step("Summarizing...", &hint_summary(cfg));
     let out = s.summarize(transcript, context).await;
     s.unload().await;
     out
